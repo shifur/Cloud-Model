@@ -1,0 +1,303 @@
+"""
+DNN Learning Curve Analysis with CRM Evaluation and Sparse Grid Testing
+- Generate training data using CRM evaluation (same as CS code)
+- Train DNN on random subsets of sizes 100, 200, ..., 1000
+- Evaluate each trained model on sparse grid points
+- Calculate L2 relative error for each output individually
+- Generate separate learning curve plots for each output
+"""
+
+import os
+import random
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Import required modules (matching CS code)
+import sys
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+import Tasmanian
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+# =============================================================================
+# PART 1: Parameter Setup (from CS code)
+# =============================================================================
+
+np.random.seed(42)
+d = 11  # All 11 parameters
+K = 6   # 6 outputs
+
+# Parameter bounds for 11D space: all parameters
+# Parameters: as, bs, ag, bg, N0r, N0s, N0g, rhos, rhog, qc0, qi0
+pmin = np.array([50.0, 0.10, 50.0, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1.e-4, 2.e-6])
+pmax = np.array([1000.0, 1.0, 1200.0, 0.90, 5.0, 2.5, 2.5, 1.0, 1.0, 2.e-3, 1.e-3])
+xnames = ['as', 'bs', 'ag', 'bg', 'N0r', 'N0s', 'N0g', 'rhos', 'rhog', 'qc0', 'qi0']
+output_names = ['PCP', 'ACC', 'LWP', 'IWP', 'OLR', 'OSR']
+
+print(f"Parameter ranges:")
+for i, name in enumerate(xnames):
+    print(f"  {name}: [{pmin[i]:.2e}, {pmax[i]:.2e}]")
+
+def map_to_canonical(X):
+    """Map from physical domain to canonical domain [-1, 1]"""
+    return 2 * (X - pmin) / (pmax - pmin) - 1
+
+def map_to_physical(X_canonical):
+    """Map from canonical domain [-1, 1] to physical domain"""
+    return 0.5 * (X_canonical + 1) * (pmax - pmin) + pmin
+
+volume_phys = np.prod(pmax - pmin)
+
+# =============================================================================
+# PART 2: Sparse Grid Setup for Evaluation (from CS code)
+# =============================================================================
+
+# Create Tasmanian sparse grid
+grid = Tasmanian.SparseGrid()
+grid.makeGlobalGrid(d, 0, 4, "level", "clenshaw-curtis")  # 11D grid
+grid.clearDomainTransform()
+
+# Get canonical domain sparse grid points and weights
+xi_can = grid.getPoints()  # shape: (m_sg, 11)
+w_can = grid.getQuadratureWeights()
+m_sg = xi_can.shape[0]
+print(f"SG grid size: {m_sg}")
+
+# Map SG points to physical domain
+x_phys_sg = 0.5 * (xi_can + 1) * (pmax - pmin) + pmin
+
+# CRM evaluation setup (from CS code)
+input_file = './cloud_column_model/run_one_crm1d.txt'
+output_file = './cloud_column_model/crm1d_output.txt'
+namelist_file = './cloud_column_model/namelist_3h_t30-180.f90'
+
+# Evaluate CRM on SG points (from CS code)
+print("Running CRM for SG evaluation...")
+runs_sg = [[input_file, output_file, namelist_file, i+1, x_phys_sg[i].tolist()] for i in range(m_sg)]
+pmap = parmap.Parmap(master='scispark6.jpl.nasa.gov:8786', mode='par', numWorkers=12)
+F_sg_full = np.array(pmap(runcrm, runs_sg))
+F_sg = F_sg_full[:, 18:24]  # Extract the 6 relevant outputs
+
+print(f"SG evaluation completed. F_sg shape: {F_sg.shape}")
+
+# Compute integration weights for L2 error calculation
+w_phys = w_can * (volume_phys / (2**d))  # 11D: divide by 2^11
+w_pos = np.abs(w_phys)
+
+# =============================================================================
+# PART 3: DNN Model Definition
+# =============================================================================
+
+layers = 8
+nodes_per_layer = 50
+init_rate = 0.001
+batch_size = 32
+
+class DNN(nn.Module):
+    def __init__(self, input_dim, output_dim, layers, nodes_per_layer):
+        super(DNN, self).__init__()
+        layers_list = [nn.Linear(input_dim, nodes_per_layer), nn.Tanh()]
+        for _ in range(layers):
+            layers_list.extend([nn.Linear(nodes_per_layer, nodes_per_layer), nn.Tanh()])
+        layers_list.append(nn.Linear(nodes_per_layer, output_dim))
+        self.layers = nn.Sequential(*layers_list)
+    
+    def forward(self, x):
+        return self.layers(x)
+
+def weights_init(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
+# Set device and random seeds
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+seed = 1
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+criterion = nn.MSELoss()
+
+print(f"\nDNN Configuration:")
+print(f"  Device: {device}")
+print(f"  Hidden layers: {layers}")
+print(f"  Nodes per layer: {nodes_per_layer}")
+print(f"  Learning rate: {init_rate}")
+print(f"  Training epochs per subset: 50000")
+
+# =============================================================================
+# PART 4: Generate Full Training Dataset using CRM
+# =============================================================================
+
+# Generate maximum training set once (like CS code)
+m_train_max = 2000  # Generate enough for maximum subset size (1000)
+x_train_max = np.random.uniform(pmin, pmax, size=(m_train_max, d))
+xi_train_max = map_to_canonical(x_train_max)
+
+print(f"Generating {m_train_max} training samples using CRM...")
+runs_train_max = [[input_file, output_file, namelist_file, i+1, x_train_max[i].tolist()] for i in range(m_train_max)]
+F_train_max_full = np.array(pmap(runcrm, runs_train_max))
+F_train_max = F_train_max_full[:, 18:24]  # Extract the 6 relevant outputs
+
+print(f"Training data generation completed. F_train_max shape: {F_train_max.shape}")
+
+# Scale inputs and outputs (matching your original approach)
+xi_train_scaled = xi_train_max  # Already in canonical domain [-1, 1]
+
+# Scale outputs to [-1, 1] using the full training set statistics
+F_min = F_train_max.min(axis=0)
+F_max = F_train_max.max(axis=0)
+F_train_scaled = 2 * (F_train_max - F_min) / (F_max - F_min) - 1
+
+print(f"Data scaling completed:")
+print(f"  xi_train_scaled shape: {xi_train_scaled.shape}")
+print(f"  F_train_scaled shape: {F_train_scaled.shape}")
+
+# =============================================================================
+# PART 5: L2 Error vs. Training Sample Size Evaluation on Random Subsets for Each Output
+# =============================================================================
+# For each training sample size (from 100 to 1000 in increments of 100), a random subset is selected,
+# a new DNN model is initialized and trained on that subset, and then the relative L2 error for each output
+# on the sparse grid is computed and stored. Separate plots for each output are generated.
+
+sample_sizes_train = np.arange(100, 2001, 100)
+# Initialize a list for each output to store the relative L2 errors.
+subset_errors_per_output = [[] for _ in range(F_train_scaled.shape[1])]  # one list per output
+
+# Define the number of epochs for training on each subset.
+subset_epochs = 50000  # adjust this value as needed
+
+print(f"\n{'='*80}")
+print("STARTING LEARNING CURVE ANALYSIS")
+print(f"{'='*80}")
+print(f"Training sample sizes: {sample_sizes_train}")
+
+for s in sample_sizes_train:
+    print(f"\nTraining subset size: {s}")
+    
+    # Randomly select s indices (without replacement) from the full training set.
+    indices = np.random.choice(xi_train_scaled.shape[0], s, replace=False)
+    X_train_subset = xi_train_scaled[indices, :]
+    Y_train_subset = F_train_scaled[indices, :]
+    
+    # Create a DataLoader for this subset.
+    subset_dataset = TensorDataset(torch.from_numpy(X_train_subset).float(),
+                                   torch.from_numpy(Y_train_subset).float())
+    subset_loader = DataLoader(subset_dataset, batch_size=batch_size, shuffle=True)
+    
+    # Initialize a fresh model and optimizer for this subset experiment.
+    model_subset = DNN(input_dim=xi_train_scaled.shape[1],
+                       output_dim=F_train_scaled.shape[1],
+                       layers=layers,
+                       nodes_per_layer=nodes_per_layer).to(device)
+    model_subset.apply(weights_init)
+    optimizer_subset = optim.Adam(model_subset.parameters(), lr=init_rate)
+    scheduler_subset = optim.lr_scheduler.ExponentialLR(
+        optimizer_subset, gamma=(5e-7 / init_rate) ** (1 / subset_epochs)
+    )
+    
+    # Train the model on the subset for the specified number of epochs.
+    model_subset.train()
+    for epoch in range(subset_epochs):
+        for x_batch, y_batch in subset_loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            optimizer_subset.zero_grad()
+            outputs = model_subset(x_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer_subset.step()
+        scheduler_subset.step()
+        
+        # Print progress
+        if (epoch + 1) % 10000 == 0:
+            print(f"  Epoch {epoch+1}/{subset_epochs}")
+    
+    # Evaluate the trained model on the sparse grid points.
+    model_subset.eval()
+    with torch.no_grad():
+        xi_can_tensor = torch.from_numpy(xi_can).float().to(device)
+        F_sg_pred_scaled = model_subset(xi_can_tensor).cpu().numpy()
+    # Invert the scaling to recover predictions in the original units.
+    F_sg_pred = (F_sg_pred_scaled + 1) / 2 * (F_max - F_min) + F_min
+    
+    # For each output, compute the relative L2 error on the sparse grid.
+    for i in range(F_sg.shape[1]):
+        # Use weighted L2 error computation (from CS code)
+        diff = F_sg[:, i] - F_sg_pred[:, i]
+        num_sq = np.dot(diff**2, w_pos)
+        denom_sq = np.dot(F_sg[:, i]**2, w_pos)
+        error = np.sqrt(num_sq) / np.sqrt(denom_sq) if denom_sq != 0 else 0
+        subset_errors_per_output[i].append(error)
+        print(f"Training subset size: {s:4d} | Output: {output_names[i]} | Relative L2 Error: {error:.6f}")
+
+# =============================================================================
+# PART 6: Generate Separate Plots for Each Output
+# =============================================================================
+
+# Generate separate plots for each output.
+for i, out_name in enumerate(output_names):
+    plt.figure(figsize=(8, 6))
+    plt.semilogy(sample_sizes_train, subset_errors_per_output[i], marker='o', linestyle='-')
+    plt.xlabel("Training Sample Size")
+    plt.ylabel("Relative L2 Error")
+    plt.title(f"Training Sample Size vs. Relative L2 Error: {out_name}")
+    plt.grid(True, which='both')
+    plt.tight_layout()
+    plt.show()
+
+# =============================================================================
+# PART 7: Results Summary
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("LEARNING CURVE RESULTS SUMMARY")
+print(f"{'='*80}")
+
+print(f"\nDetailed Results:")
+print(f"{'Train Size':<12}", end="")
+for out_name in output_names:
+    print(f"{out_name:<12}", end="")
+print()
+print(f"{'-'*(12 + 12*len(output_names))}")
+
+for i, train_size in enumerate(sample_sizes_train):
+    print(f"{train_size:<12}", end="")
+    for j in range(len(output_names)):
+        print(f"{subset_errors_per_output[j][i]:<12.6f}", end="")
+    print()
+
+print(f"\nFinal Performance (Training Size: {sample_sizes_train[-1]}):")
+print(f"{'Output':<10} {'L2 Error':<12}")
+print(f"{'-'*25}")
+
+for i, output_name in enumerate(output_names):
+    final_error = subset_errors_per_output[i][-1]
+    print(f"{output_name:<10} {final_error:<12.6f}")
+
+print(f"\nBest Performance for Each Output:")
+print(f"{'Output':<10} {'Best Size':<12} {'Best Error':<12}")
+print(f"{'-'*40}")
+
+for i, output_name in enumerate(output_names):
+    best_idx = np.argmin(subset_errors_per_output[i])
+    best_size = sample_sizes_train[best_idx]
+    best_error = subset_errors_per_output[i][best_idx]
+    print(f"{output_name:<10} {best_size:<12} {best_error:<12.6f}")
+
+print(f"\nSummary:")
+print(f"- Parameter space: {d}D (all parameters)")
+print(f"- SG grid size for evaluation: {m_sg}")
+print(f"- Training sizes tested: {list(sample_sizes_train)}")
+print(f"- Training epochs per subset: {subset_epochs}")
+print(f"- Training data generated using CRM evaluation")
+print(f"- Evaluation performed on sparse grid points")
