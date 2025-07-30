@@ -1,0 +1,695 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import legendre
+import sys
+import time
+
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+
+import Tasmanian
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+# =============================================================================
+# OPTIMIZED ALGORITHMS 2 & 5 - Matrix-Based Step Sizes Only
+# =============================================================================
+
+def primal_dual_weighted_sr_lasso(A, b, w, lambda_param, tau, sigma, T, x_init=None, y_init=None):
+    """
+    Algorithm 2 Modified for Scalar-Valued Weighted SR-LASSO (K=1)
+    - Matrix-based step sizes
+    - Identity Gram matrix (G = I)
+    - Weighted structure only
+    """
+    m, N = A.shape
+    
+    # Initialize variables
+    if x_init is None:
+        x = np.zeros(N)
+    else:
+        x = np.copy(x_init)
+    
+    if y_init is None:
+        y = np.zeros(m)
+    else:
+        y = np.copy(y_init)
+    
+    x_bar = np.zeros(N)  # Ergodic sequence
+    
+    # Main primal-dual iterations (Algorithm 2 from book)
+    for n in range(T):
+        # Step 2: P = C^(n) - τ * A^T * Λ^(n)
+        p = x - tau * A.T @ y
+        
+        # Steps 3-6: Weighted soft thresholding for scalar case
+        # Since G = I (identity), ||G^(1/2) * p_i||_2 = |p_i|
+        x_new = np.zeros(N)
+        for i in range(N):
+            threshold = tau * lambda_param * w[i]
+            if np.abs(p[i]) > threshold:
+                x_new[i] = np.sign(p[i]) * (np.abs(p[i]) - threshold)
+            else:
+                x_new[i] = 0.0
+        
+        # Step 8: Q = Λ^(n) + σ * A * (2*C^(n+1) - C^(n)) - σ * B
+        q = y + sigma * A @ (2 * x_new - x) - sigma * b
+        
+        # Step 9: Projection onto unit ball
+        # Since G = I, ||Q * G^(1/2)||_{2,2} = ||Q||_2
+        norm_q = np.linalg.norm(q)
+        if norm_q > 1.0:
+            y_new = q / norm_q
+        else:
+            y_new = q
+        
+        # Step 10: Update ergodic sequence
+        x_bar = (n / (n + 1)) * x_bar + (1 / (n + 1)) * x_new
+        
+        # Update for next iteration
+        x = x_new
+        y = y_new
+    
+    return x
+
+def restarted_primal_dual_weighted_sr_lasso(A, b, w, lambda_param, T, R, eps_0, r, s, tau, sigma):
+    """
+    Algorithm 5 Modified for Scalar-Valued Weighted SR-LASSO (K=1)
+    - Matrix-based step sizes
+    - Restarted version for exponential convergence
+    """
+    m, N = A.shape
+    
+    # Initialize (Algorithm 5)
+    x_tilde = np.zeros(N)
+    eps_l = np.linalg.norm(b)  # ε₀ = ||B||_2 from Algorithm 5
+    
+    # Main restart loop
+    for l in range(R):
+        # Step 2: ε_{l+1} = r * (ε_l + ε₀)
+        eps_l = r * (eps_l + eps_0)
+        
+        # Step 3: a_l = s * ε_{l+1}
+        a_l = s * eps_l
+        
+        # Step 4: Call Algorithm 2 with scaled inputs
+        if a_l > 1e-15:  # Avoid numerical issues
+            # Scale inputs as per Algorithm 5
+            x_init_scaled = x_tilde / a_l if np.linalg.norm(x_tilde) > 0 else np.zeros(N)
+            y_init_scaled = np.zeros(m)
+            b_scaled = b / a_l
+            
+            # Call basic primal-dual algorithm with matrix step sizes
+            x_result = primal_dual_weighted_sr_lasso(
+                A, b_scaled, w, lambda_param, tau, sigma, T, 
+                x_init_scaled, y_init_scaled
+            )
+            
+            # Scale back to original problem
+            x_tilde = a_l * x_result
+    
+    return x_tilde
+
+# =============================================================================
+# ATMOSPHERIC MODELING CODE WITH WEIGHTED SR-LASSO ONLY
+# =============================================================================
+
+# 1. Setup - Modified for 11D (ALL parameters)
+np.random.seed(42)
+d = 11  # All 11 parameters
+K = 6   # 6 output variables
+
+# Parameter bounds for 11D space: all parameters
+# Parameters: as, bs, ag, bg, N0r, N0s, N0g, rhos, rhog, qc0, qi0
+pmin = np.array([50.0, 0.10, 50.0, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1.e-4, 2.e-6])
+pmax = np.array([1000.0, 1.0, 1200.0, 0.90, 5.0, 2.5, 2.5, 1.0, 1.0, 2.e-3, 1.e-3])
+xnames = ['as', 'bs', 'ag', 'bg', 'N0r', 'N0s', 'N0g', 'rhos', 'rhog', 'qc0', 'qi0']
+
+volume_phys = np.prod(pmax - pmin)
+
+print(f"11D Parameter Analysis Setup:")
+print(f"Varying parameters ({d}D - ALL parameters):")
+for i, name in enumerate(xnames):
+    print(f"  {name}: [{pmin[i]:.2e}, {pmax[i]:.2e}]")
+
+def map_to_canonical(X):
+    return 2 * (X - pmin) / (pmax - pmin) - 1
+
+# 2. Multi-index generation
+HCfunc = lambda x: np.prod(x + 1) - 1
+p_poly = 20  # Reduced for 11D computational feasibility
+
+def multiidx_gen(N, rule, w, base=0, multiidx=np.array([]), MULTI_IDX=np.array([])):
+    if len(multiidx) != N:
+        i = base
+        while rule(np.append(multiidx, i)) <= w:
+            MULTI_IDX = multiidx_gen(N, rule, w, base, np.append(multiidx, i), MULTI_IDX)
+            i += 1
+    else:
+        MULTI_IDX = np.vstack([MULTI_IDX, multiidx]) if MULTI_IDX.size else multiidx
+    return MULTI_IDX
+
+Lambda = multiidx_gen(d, HCfunc, p_poly).astype(int)
+N_basis = Lambda.shape[0]
+print(f"11D basis size: {N_basis}")
+
+# Compute intrinsic weights for Legendre polynomials (Book's formula 4.7)
+def compute_intrinsic_weights_legendre(Lambda):
+    """
+    Compute intrinsic weights for Legendre polynomials
+    Book's formula: u_ν = ∏_{j=1}^d √(2ν_j + 1)
+    """
+    N_basis = Lambda.shape[0]
+    weights = np.ones(N_basis)
+    
+    for n in range(N_basis):
+        for k in range(Lambda.shape[1]):
+            # Intrinsic weight for Legendre: sqrt(2*nu_k + 1)
+            weights[n] *= np.sqrt(2 * Lambda[n, k] + 1)
+    
+    return weights
+
+# Generate intrinsic weights
+weights = compute_intrinsic_weights_legendre(Lambda)
+print(f"Intrinsic weights computed - Range: [{np.min(weights):.3f}, {np.max(weights):.3f}]")
+
+# Weight analysis
+print(f"\nWeight Analysis:")
+print(f"- Number of basis functions: {N_basis}")
+print(f"- Min weight: {np.min(weights):.6f}")
+print(f"- Max weight: {np.max(weights):.6f}")
+print(f"- Weight ratio (max/min): {np.max(weights)/np.min(weights):.2f}")
+
+# 3. Tasmanian Sparse Grid setup
+grid = Tasmanian.SparseGrid()
+grid.makeGlobalGrid(d, 0, 3, "level", "clenshaw-curtis")  # 11D grid (reduced level for computational feasibility)
+grid.clearDomainTransform()
+
+xi_can = grid.getPoints()
+w_can = grid.getQuadratureWeights()
+m_sg = xi_can.shape[0]
+print(f"SG grid size: {m_sg}")
+
+# 4. Evaluate Cloud Model
+x_phys_sg = 0.5 * (xi_can + 1) * (pmax - pmin) + pmin
+
+input_file = './cloud_column_model/run_one_crm1d.txt'
+output_file = './cloud_column_model/crm1d_output.txt'
+namelist_file = './cloud_column_model/namelist_3h_t30-180.f90'
+
+runs_sg = [[input_file, output_file, namelist_file, i+1, x_phys_sg[i].tolist()] for i in range(m_sg)]
+print("Running CRM for SG projection...")
+pmap = parmap.Parmap(master='scispark6.jpl.nasa.gov:8786', mode='par', numWorkers=12)
+F_sg_full = np.array(pmap(runcrm, runs_sg))
+F_sg = F_sg_full[:, 18:24]
+
+# 5. Build Psi_sg for 11D tensor product
+Psi_sg = np.ones((m_sg, N_basis))
+for n in range(N_basis):
+    for k in range(d):  # k=0 to 10 for all 11 parameters
+        Pk = legendre(Lambda[n, k])
+        norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+        Psi_sg[:, n] *= norm * Pk(xi_can[:, k])
+
+# 6. SG Gram Matrix and Coefficients
+G_sg = Psi_sg.T @ (w_can[:, None] * Psi_sg)
+coeff_sg = Psi_sg.T @ (w_can[:, None] * F_sg)
+
+diag_err = np.max(np.abs(np.diag(G_sg) - 1.0))
+offdiag_err = np.max(np.abs(G_sg - np.diag(np.diag(G_sg))))
+print(f"SG Gram matrix - Diagonal error: {diag_err:.2e}, Off-diagonal error: {offdiag_err:.2e}")
+
+# 7. SR-LASSO Training Samples (Fixed size demo)
+m_train = 1000
+x_train = np.random.uniform(pmin, pmax, size=(m_train, d))
+xi_train = map_to_canonical(x_train)
+
+runs_train = [[input_file, output_file, namelist_file, i+1, x_train[i].tolist()] for i in range(m_train)]
+print("Running CRM for SR-LASSO training...")
+F_train_full = np.array(pmap(runcrm, runs_train))
+F_train = F_train_full[:, 18:24]
+
+# 8. Build A matrix for 11D
+A = np.ones((m_train, N_basis))
+for n in range(N_basis):
+    for k in range(d):
+        Pk = legendre(Lambda[n, k])
+        norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+        A[:, n] *= norm * Pk(xi_train[:, k])
+
+A /= np.sqrt(m_train)
+b = F_train / np.sqrt(m_train)
+
+# =============================================================================
+# OPTIMIZED WEIGHTED SR-LASSO SOLVER - Matrix Step Sizes Only (Demo)
+# =============================================================================
+print("\n=== WEIGHTED SR-LASSO WITH OPTIMIZED PRIMAL-DUAL ALGORITHMS (Demo) ===")
+print("Using Matrix-Based Step Sizes for Optimal Performance")
+
+# Basic parameters
+lambda_param = 1e-5  # Regularization parameter
+
+# Matrix-Based Step Sizes (Optimal)
+norm_A = np.linalg.norm(A, ord=2)
+tau = 0.99 / norm_A  # Slightly less than 1/||A||₂ for stability
+sigma = 0.99 / norm_A
+
+print(f"Optimized Parameters:")
+print(f"- λ: {lambda_param:.6f}")
+print(f"- ||A||₂: {norm_A:.6f}")
+print(f"- τ = σ: {tau:.6f}")
+
+# Iteration counts - Optimized for best performance
+T_basic = 500   # Iterations for basic PD
+T_restart = 50  # Iterations per restart
+R_restart = 10  # Number of restarts
+
+# Restart parameters
+r = np.exp(-1)  # r = e^(-1)
+s = tau * T_restart / 2
+eps_0 = 1e-6
+
+print(f"- Basic PD iterations: {T_basic}")
+print(f"- Restart PDR: {T_restart} × {R_restart} = {T_restart * R_restart} total iterations")
+
+# Solve weighted SR-LASSO for each output using optimized algorithms
+xhat_pd = np.zeros((N_basis, K))    # PD with matrix step sizes
+xhat_pdr = np.zeros((N_basis, K))   # PDR with matrix step sizes
+
+print("\nSolving Weighted SR-LASSO with optimized algorithms...")
+start_time = time.time()
+
+output_names = ['PCP', 'ACC', 'LWP', 'IWP', 'OLR', 'OSR']
+
+for k in range(K):
+    print(f"  Solving for {output_names[k]} ({k+1}/{K})")
+    
+    # Basic PD with matrix step sizes
+    xhat_pd[:, k] = primal_dual_weighted_sr_lasso(
+        A, b[:, k], weights, lambda_param, tau, sigma, T_basic
+    )
+    
+    # Restart PDR with matrix step sizes
+    xhat_pdr[:, k] = restarted_primal_dual_weighted_sr_lasso(
+        A, b[:, k], weights, lambda_param, T_restart, R_restart, eps_0, r, s, tau, sigma
+    )
+
+end_time = time.time()
+print(f"✔️ All Weighted SR-LASSO problems solved in {end_time - start_time:.2f} seconds")
+
+# Sparsity analysis
+print(f"\nSparsity Analysis:")
+for k in range(K):
+    nz_sg = np.count_nonzero(np.abs(coeff_sg[:, k]) > 1e-12)
+    nz_pd = np.count_nonzero(np.abs(xhat_pd[:, k]) > 1e-12)
+    nz_pdr = np.count_nonzero(np.abs(xhat_pdr[:, k]) > 1e-12)
+    
+    print(f"- {output_names[k]}:")
+    print(f"  SG:        {nz_sg}/{N_basis} ({100*nz_sg/N_basis:.1f}%)")
+    print(f"  PD:        {nz_pd}/{N_basis} ({100*nz_pd/N_basis:.1f}%)")
+    print(f"  PDR:       {nz_pdr}/{N_basis} ({100*nz_pdr/N_basis:.1f}%)")
+
+# =============================================================================
+# L2 Relative Error Computation (Demo)
+# =============================================================================
+volume_phys_11d = np.prod(pmax - pmin)
+w_phys = w_can * (volume_phys_11d / (2**d))  # 11D: divide by 2^11
+w_pos = np.abs(w_phys)
+
+# Build evaluation matrix
+Psi_SG = np.ones((m_sg, N_basis))
+for n in range(N_basis):
+    for k in range(d):
+        Pk = legendre(Lambda[n, k])
+        norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+        Psi_SG[:, n] *= norm * Pk(xi_can[:, k])
+
+# Evaluate all methods
+y_SG_true = F_sg  # True SG values
+y_SG_pd = Psi_SG @ xhat_pd
+y_SG_pdr = Psi_SG @ xhat_pdr
+
+# Compute L2 relative errors
+l2_error_pd = np.zeros(K)
+l2_error_pdr = np.zeros(K)
+
+for k in range(K):
+    denom_sq = np.dot(y_SG_true[:, k]**2, w_pos)
+    
+    if denom_sq > 0:
+        # PD error
+        diff = y_SG_true[:, k] - y_SG_pd[:, k]
+        l2_error_pd[k] = np.sqrt(np.dot(diff**2, w_pos) / denom_sq)
+        
+        # PDR error
+        diff = y_SG_true[:, k] - y_SG_pdr[:, k]
+        l2_error_pdr[k] = np.sqrt(np.dot(diff**2, w_pos) / denom_sq)
+
+print(f"\nL2 Relative Test Errors (Demo - {m_train} samples):")
+print(f"PD:  {l2_error_pd}")
+print(f"PDR: {l2_error_pdr}")
+
+# =============================================================================
+# LEARNING CURVE ANALYSIS WITH PD/PDR ALGORITHMS
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("STARTING 11D LEARNING CURVE ANALYSIS")
+print(f"{'='*80}")
+
+# Training sample sizes to test
+train_sizes = list(range(50, 2001, 50))  # 50, 100, 150, ..., 1000
+print(f"Training sizes to test: {train_sizes}")
+
+# Storage for learning curve results
+learning_curve_results = {
+    'train_sizes': train_sizes,
+    'l2_errors_pd': [],
+    'l2_errors_pdr': [],
+    'sparsity_pd': [],
+    'sparsity_pdr': [],
+    'solve_times_pd': [],
+    'solve_times_pdr': []
+}
+
+# Generate maximum training set once
+m_train_max = max(train_sizes)
+x_train_max = np.random.uniform(pmin, pmax, size=(m_train_max, d))
+xi_train_max = map_to_canonical(x_train_max)
+
+print(f"Generating {m_train_max} training samples for learning curve...")
+runs_train_max = [[input_file, output_file, namelist_file, i+1, x_train_max[i].tolist()] for i in range(m_train_max)]
+F_train_max_full = np.array(pmap(runcrm, runs_train_max))
+F_train_max = F_train_max_full[:, 18:24]
+
+# Learning curve loop
+for train_size in train_sizes:
+    print(f"\n{'='*60}")
+    print(f"Learning Curve: Training with {train_size} samples")
+    print(f"{'='*60}")
+    
+    # Use subset of training data
+    x_train_subset = x_train_max[:train_size]
+    xi_train_subset = xi_train_max[:train_size]
+    F_train_subset = F_train_max[:train_size]
+    
+    # Build A matrix for current training size
+    A_subset = np.ones((train_size, N_basis))
+    for n in range(N_basis):
+        for k in range(d):
+            Pk = legendre(Lambda[n, k])
+            norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+            A_subset[:, n] *= norm * Pk(xi_train_subset[:, k])
+
+    A_subset /= np.sqrt(train_size)
+    b_subset = F_train_subset / np.sqrt(train_size)
+
+    # Algorithm parameters (same as demo)
+    lambda_param = 1e-5
+    norm_A_subset = np.linalg.norm(A_subset, ord=2)
+    tau_subset = 0.99 / norm_A_subset
+    sigma_subset = 0.99 / norm_A_subset
+    
+    # Iteration counts (same as demo)
+    T_basic = 500
+    T_restart = 50
+    R_restart = 10
+    r = np.exp(-1)
+    s = tau_subset * T_restart / 2
+    eps_0 = 1e-6
+    
+    print(f"Algorithm parameters:")
+    print(f"  λ = {lambda_param:.6f}, ||A||₂ = {norm_A_subset:.6f}")
+    print(f"  PD: T = {T_basic}, PDR: T = {T_restart}, R = {R_restart}")
+    
+    # Initialize coefficient arrays
+    xhat_pd_curve = np.zeros((N_basis, K))
+    xhat_pdr_curve = np.zeros((N_basis, K))
+    
+    # Solve for each output using both PD and PDR
+    start_time_pd = time.time()
+    for k in range(K):
+        xhat_pd_curve[:, k] = primal_dual_weighted_sr_lasso(
+            A_subset, b_subset[:, k], weights, lambda_param, tau_subset, sigma_subset, T_basic
+        )
+    end_time_pd = time.time()
+    solve_time_pd = end_time_pd - start_time_pd
+    
+    start_time_pdr = time.time()
+    for k in range(K):
+        xhat_pdr_curve[:, k] = restarted_primal_dual_weighted_sr_lasso(
+            A_subset, b_subset[:, k], weights, lambda_param, T_restart, R_restart, eps_0, r, s, tau_subset, sigma_subset
+        )
+    end_time_pdr = time.time()
+    solve_time_pdr = end_time_pdr - start_time_pdr
+    
+    print(f"✔️ PD solved in {solve_time_pd:.2f} seconds")
+    print(f"✔️ PDR solved in {solve_time_pdr:.2f} seconds")
+    
+    # Evaluate surrogates on SG points
+    y_SG_eval_pd = Psi_SG @ xhat_pd_curve
+    y_SG_eval_pdr = Psi_SG @ xhat_pdr_curve
+    y_true_SG = F_sg
+    
+    # Compute L2 relative errors
+    l2_rel_error_pd = np.zeros(K)
+    l2_rel_error_pdr = np.zeros(K)
+    
+    for k in range(K):
+        denom_sq = np.dot(y_true_SG[:, k]**2, w_pos)
+        if denom_sq > 0:
+            # PD errors
+            diff_pd = y_true_SG[:, k] - y_SG_eval_pd[:, k]
+            l2_rel_error_pd[k] = np.sqrt(np.dot(diff_pd**2, w_pos) / denom_sq)
+            
+            # PDR errors
+            diff_pdr = y_true_SG[:, k] - y_SG_eval_pdr[:, k]
+            l2_rel_error_pdr[k] = np.sqrt(np.dot(diff_pdr**2, w_pos) / denom_sq)
+        else:
+            l2_rel_error_pd[k] = np.nan
+            l2_rel_error_pdr[k] = np.nan
+    
+    # Calculate sparsity
+    sparsity_pd = [np.count_nonzero(np.abs(xhat_pd_curve[:, k]) > 1e-12) for k in range(K)]
+    sparsity_pdr = [np.count_nonzero(np.abs(xhat_pdr_curve[:, k]) > 1e-12) for k in range(K)]
+    
+    # Store results
+    learning_curve_results['l2_errors_pd'].append(l2_rel_error_pd.copy())
+    learning_curve_results['l2_errors_pdr'].append(l2_rel_error_pdr.copy())
+    learning_curve_results['sparsity_pd'].append(sparsity_pd)
+    learning_curve_results['sparsity_pdr'].append(sparsity_pdr)
+    learning_curve_results['solve_times_pd'].append(solve_time_pd)
+    learning_curve_results['solve_times_pdr'].append(solve_time_pdr)
+    
+    print(f"L2 Relative Errors:")
+    print(f"  PD:  {l2_rel_error_pd}")
+    print(f"  PDR: {l2_rel_error_pdr}")
+    print(f"Average L2 Error:")
+    print(f"  PD:  {np.mean(l2_rel_error_pd):.6f}")
+    print(f"  PDR: {np.mean(l2_rel_error_pdr):.6f}")
+
+# =============================================================================
+# LEARNING CURVE VISUALIZATION
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("11D LEARNING CURVE ANALYSIS COMPLETE - PD/PDR ALGORITHMS")
+print(f"{'='*80}")
+
+# Convert results to numpy arrays for easier plotting
+l2_errors_pd_array = np.array(learning_curve_results['l2_errors_pd'])
+l2_errors_pdr_array = np.array(learning_curve_results['l2_errors_pdr'])
+
+# Plot learning curves for each output
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+axes = axes.flatten()
+
+for k in range(K):
+    ax = axes[k]
+    
+    # Plot learning curves
+    ax.loglog(train_sizes, l2_errors_pd_array[:, k], 'o-', 
+             label='PD Algorithm', color='blue', linewidth=2, markersize=6)
+    ax.loglog(train_sizes, l2_errors_pdr_array[:, k], 's-', 
+             label='PDR Algorithm', color='red', linewidth=2, markersize=6)
+    
+    ax.set_xlabel('Training Sample Size')
+    ax.set_ylabel('L2 Relative Error')
+    ax.set_title(f'Learning Curve: {output_names[k]} (11D: All Parameters)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add theoretical decay line for reference
+    theoretical_decay = 0.1 * (np.array(train_sizes) / train_sizes[0])**(-0.5)
+    ax.loglog(train_sizes, theoretical_decay, '--', color='gray', alpha=0.7, label='m^(-1/2) reference')
+
+plt.suptitle('11D Learning Curves (All Parameters) with PD/PDR Algorithms', fontsize=16)
+plt.tight_layout()
+plt.show()
+
+# Plot average learning curve
+fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+avg_l2_pd = np.mean(l2_errors_pd_array, axis=1)
+avg_l2_pdr = np.mean(l2_errors_pdr_array, axis=1)
+
+ax.loglog(train_sizes, avg_l2_pd, 'o-', 
+         label='PD Algorithm (Average)', color='blue', linewidth=3, markersize=8)
+ax.loglog(train_sizes, avg_l2_pdr, 's-', 
+         label='PDR Algorithm (Average)', color='red', linewidth=3, markersize=8)
+
+# Add theoretical decay line
+theoretical_decay = 0.1 * (np.array(train_sizes) / train_sizes[0])**(-0.5)
+ax.loglog(train_sizes, theoretical_decay, '--', color='gray', alpha=0.7, 
+         label='m^(-1/2) reference', linewidth=2)
+
+ax.set_xlabel('Training Sample Size', fontsize=14)
+ax.set_ylabel('Average L2 Relative Error', fontsize=14)
+ax.set_title('11D Average Learning Curve: PD vs PDR (All Parameters)', fontsize=16)
+ax.legend(fontsize=12)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Plot sparsity evolution
+sparsity_pd_array = np.array(learning_curve_results['sparsity_pd'])
+sparsity_pdr_array = np.array(learning_curve_results['sparsity_pdr'])
+
+fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+avg_sparsity_pd = np.mean(sparsity_pd_array, axis=1)
+avg_sparsity_pdr = np.mean(sparsity_pdr_array, axis=1)
+
+ax.plot(train_sizes, avg_sparsity_pd, 'o-', 
+        label='PD Algorithm', color='blue', linewidth=2, markersize=6)
+ax.plot(train_sizes, avg_sparsity_pdr, 's-', 
+        label='PDR Algorithm', color='red', linewidth=2, markersize=6)
+
+ax.set_xlabel('Training Sample Size', fontsize=14)
+ax.set_ylabel('Average Number of Nonzero Coefficients', fontsize=14)
+ax.set_title('11D Sparsity Evolution: PD vs PDR (All Parameters)', fontsize=16)
+ax.legend(fontsize=12)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Plot solve times comparison
+fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+solve_times_pd = learning_curve_results['solve_times_pd']
+solve_times_pdr = learning_curve_results['solve_times_pdr']
+
+ax.plot(train_sizes, solve_times_pd, 'o-', 
+        label='PD Algorithm', color='blue', linewidth=2, markersize=6)
+ax.plot(train_sizes, solve_times_pdr, 's-', 
+        label='PDR Algorithm', color='red', linewidth=2, markersize=6)
+
+ax.set_xlabel('Training Sample Size', fontsize=14)
+ax.set_ylabel('Solve Time (seconds)', fontsize=14)
+ax.set_title('11D Computational Time: PD vs PDR (All Parameters)', fontsize=16)
+ax.legend(fontsize=12)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# =============================================================================
+# OPTIMIZED COEFFICIENT VISUALIZATION - Best Methods Only (Final Results)
+# =============================================================================
+
+# Use final training size results for visualization
+final_pd = xhat_pd_curve if 'xhat_pd_curve' in locals() else xhat_pd
+final_pdr = xhat_pdr_curve if 'xhat_pdr_curve' in locals() else xhat_pdr
+
+N = N_basis
+inds = np.arange(N)
+
+for k in range(K):
+    # Get coefficients for all three best methods
+    xhat_SG = coeff_sg[:, k]
+    xhat_PD = final_pd[:, k]
+    xhat_PDR = final_pdr[:, k]
+    
+    # Compute weighted coefficients
+    weighted_xhat_SG = weights * np.abs(xhat_SG)
+    weighted_xhat_PD = weights * np.abs(xhat_PD)
+    weighted_xhat_PDR = weights * np.abs(xhat_PDR)
+    
+    # Create 2x2 subplot layout
+    fig, axs = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # --- (1) UNWEIGHTED Coefficient Comparison ---
+    axs[0,0].plot(inds, np.abs(xhat_SG), 'o', label='SG', alpha=0.7, color='red', markersize=4)
+    axs[0,0].plot(inds, np.abs(xhat_PD), '+', label='PD (Matrix)', alpha=0.7, color='blue', markersize=6)
+    axs[0,0].plot(inds, np.abs(xhat_PDR), 'x', label='PDR (Matrix)', alpha=0.7, color='green', markersize=6)
+    axs[0,0].set_yscale('log')
+    axs[0,0].set_xlabel('Basis Index')
+    axs[0,0].set_ylabel('|Coefficient|')
+    axs[0,0].set_title(f'Unweighted Coefficients: {output_names[k]} (11D: All Parameters)')
+    axs[0,0].legend()
+    axs[0,0].grid(True, alpha=0.3)
+    
+    # --- (2) SORTED Unweighted Coefficient Decay ---
+    axs[0,1].scatter(inds, np.sort(np.abs(xhat_SG))[::-1], marker='o', label='Sorted SG', alpha=0.7, color='red', s=20)
+    axs[0,1].scatter(inds, np.sort(np.abs(xhat_PD))[::-1], marker='+', label='Sorted PD', alpha=0.7, color='blue', s=30)
+    axs[0,1].scatter(inds, np.sort(np.abs(xhat_PDR))[::-1], marker='x', label='Sorted PDR', alpha=0.7, color='green', s=30)
+    axs[0,1].set_yscale('log')
+    axs[0,1].set_xlabel('Sorted Index')
+    axs[0,1].set_ylabel('|Coefficient|')
+    axs[0,1].set_title(f'Sorted Unweighted Coefficient Decay: {output_names[k]} (11D: All Parameters)')
+    axs[0,1].legend()
+    axs[0,1].grid(True, alpha=0.3)
+    
+    # --- (3) WEIGHTED Coefficient Comparison ---
+    axs[1,0].plot(inds, weighted_xhat_SG, 'o', label='Weighted SG', alpha=0.7, color='red', markersize=4)
+    axs[1,0].plot(inds, weighted_xhat_PD, '+', label='Weighted PD', alpha=0.7, color='blue', markersize=6)
+    axs[1,0].plot(inds, weighted_xhat_PDR, 'x', label='Weighted PDR', alpha=0.7, color='green', markersize=6)
+    axs[1,0].set_yscale('log')
+    axs[1,0].set_xlabel('Basis Index')
+    axs[1,0].set_ylabel('Weight × |Coefficient|')
+    axs[1,0].set_title(f'Weighted Coefficients: {output_names[k]} (11D: All Parameters)')
+    axs[1,0].legend()
+    axs[1,0].grid(True, alpha=0.3)
+    
+    # --- (4) SORTED Weighted Coefficient Decay ---
+    axs[1,1].scatter(inds, np.sort(weighted_xhat_SG)[::-1], marker='o', label='Sorted Weighted SG', alpha=0.7, color='red', s=20)
+    axs[1,1].scatter(inds, np.sort(weighted_xhat_PD)[::-1], marker='+', label='Sorted Weighted PD', alpha=0.7, color='blue', s=30)
+    axs[1,1].scatter(inds, np.sort(weighted_xhat_PDR)[::-1], marker='x', label='Sorted Weighted PDR', alpha=0.7, color='green', s=30)
+    axs[1,1].set_yscale('log')
+    axs[1,1].set_xlabel('Sorted Index')
+    axs[1,1].set_ylabel('Weight × |Coefficient|')
+    axs[1,1].set_title(f'Sorted Weighted Coefficient Decay: {output_names[k]} (11D: All Parameters)')
+    axs[1,1].legend()
+    axs[1,1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+# Summary table
+print(f"\n11D LEARNING CURVE SUMMARY (PD/PDR ALGORITHMS):")
+print(f"{'Train Size':<12} {'PD Avg Error':<15} {'PDR Avg Error':<16} {'PD Time':<10} {'PDR Time':<11} {'PDR Speedup':<12}")
+print(f"{'-'*95}")
+
+for i, train_size in enumerate(train_sizes):
+    pd_avg = np.mean(l2_errors_pd_array[i])
+    pdr_avg = np.mean(l2_errors_pdr_array[i])
+    pd_time = solve_times_pd[i]
+    pdr_time = solve_times_pdr[i]
+    speedup = pd_time / pdr_time if pdr_time > 0 else float('inf')
+    
+    print(f"{train_size:<12} {pd_avg:<15.6f} {pdr_avg:<16.6f} {pd_time:<10.2f}s {pdr_time:<11.2f}s {speedup:<12.2f}x")
+
+print(f"\nFinal Summary (11D PD/PDR Learning Curves):")
+print(f"- Parameter space: 11D (All atmospheric parameters)")
+print(f"  All parameters: {', '.join(xnames)}")
+print(f"- Polynomial degree: p={p_poly}")
+print(f"- Basis size: {N_basis}")
+print(f"- SG grid size: {m_sg}")
+print(f"- Training sizes tested: {len(train_sizes)}")
+print(f"- Final training size: {max(train_sizes)}")
+print(f"- Algorithm parameters: λ=1e-5, τ=σ=0.99/||A||₂, T_pd=500, T_pdr=50×10")
+print(f"- Best PD average error: {np.min(avg_l2_pd):.6f}")
+print(f"- Best PDR average error: {np.min(avg_l2_pdr):.6f}")
+print(f"- Average computational speedup (PD/PDR): {np.mean([pd_time/pdr_time for pd_time, pdr_time in zip(solve_times_pd, solve_times_pdr)]):.2f}x")
+print(f"- Intrinsic weights: Legendre with range [{np.min(weights):.3f}, {np.max(weights):.3f}]")
