@@ -1,0 +1,369 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import legendre
+import cvxpy as cp
+import sys
+import time
+
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+
+import Tasmanian
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+# 1. Setup - Modified for 11D (all parameters)
+np.random.seed(42)
+d = 11  # All 11 parameters
+K = 6
+
+# Parameter bounds for 11D space: all parameters
+# Parameters: as, bs, ag, bg, N0r, N0s, N0g, rhos, rhog, qc0, qi0
+pmin = np.array([50.0, 0.10, 50.0, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1.e-4, 2.e-6])
+pmax = np.array([1000.0, 1.0, 1200.0, 0.90, 5.0, 2.5, 2.5, 1.0, 1.0, 2.e-3, 1.e-3])
+xnames = ['as', 'bs', 'ag', 'bg', 'N0r', 'N0s', 'N0g', 'rhos', 'rhog', 'qc0', 'qi0']
+
+print(f"Parameter ranges:")
+for i, name in enumerate(xnames):
+    print(f"  {name}: [{pmin[i]:.2e}, {pmax[i]:.2e}]")
+
+volume_phys = np.prod(pmax - pmin)
+
+def map_to_canonical(X):
+    return 2 * (X - pmin) / (pmax - pmin) - 1
+
+# 2. Multi-index generation
+HCfunc = lambda x: np.prod(x + 1) - 1
+p_poly = 20  # Reduced for 11D computational feasibility
+
+def multiidx_gen(N, rule, w, base=0, multiidx=np.array([]), MULTI_IDX=np.array([])):
+    if len(multiidx) != N:
+        i = base
+        while rule(np.append(multiidx, i)) <= w:
+            MULTI_IDX = multiidx_gen(N, rule, w, base, np.append(multiidx, i), MULTI_IDX)
+            i += 1
+    else:
+        MULTI_IDX = np.vstack([MULTI_IDX, multiidx]) if MULTI_IDX.size else multiidx
+    return MULTI_IDX
+
+Lambda = multiidx_gen(d, HCfunc, p_poly).astype(int)
+N_basis = Lambda.shape[0]
+print(f"11D basis size: {N_basis}")
+
+# Compute intrinsic weights for Legendre polynomials
+def compute_intrinsic_weights_legendre(Lambda):
+    """
+    Compute intrinsic weights for Legendre polynomials
+    Book's formula: u_ν = ∏_{j=1}^d √(2ν_j + 1)
+    """
+    N_basis = Lambda.shape[0]
+    weights = np.ones(N_basis)
+    
+    for n in range(N_basis):
+        for k in range(Lambda.shape[1]):  # for each dimension
+            # Intrinsic weight for Legendre: sqrt(2*nu_k + 1)
+            weights[n] *= np.sqrt(2 * Lambda[n, k] + 1)
+    
+    return weights
+
+# Generate intrinsic weights
+weights = compute_intrinsic_weights_legendre(Lambda)
+print(f"Intrinsic weights computed - Range: [{np.min(weights):.3f}, {np.max(weights):.3f}]")
+
+# 3. Tasmanian Sparse Grid setup
+grid = Tasmanian.SparseGrid()
+grid.makeGlobalGrid(d, 0, 4, "level", "clenshaw-curtis")  # 11D grid (reduced level for computational feasibility)
+grid.clearDomainTransform()
+
+# canonical domain
+xi_can = grid.getPoints()  # shape: (m_sg, 11)
+w_can = grid.getQuadratureWeights()
+m_sg = xi_can.shape[0]
+print(f"SG grid size: {m_sg}")
+
+# 4. Evaluate Cloud Model on SG points
+# Map 11D canonical points to physical domain
+x_phys_sg = 0.5 * (xi_can + 1) * (pmax - pmin) + pmin
+
+input_file = './cloud_column_model/run_one_crm1d.txt'
+output_file = './cloud_column_model/crm1d_output.txt'
+namelist_file = './cloud_column_model/namelist_3h_t30-180.f90'
+
+runs_sg = [[input_file, output_file, namelist_file, i+1, x_phys_sg[i].tolist()] for i in range(m_sg)]
+print("Running CRM for SG projection...")
+pmap = parmap.Parmap(master='scispark6.jpl.nasa.gov:8786', mode='par', numWorkers=12)
+F_sg_full = np.array(pmap(runcrm, runs_sg))
+F_sg = F_sg_full[:, 18:24]
+
+# 5. Build Psi_sg for 11D tensor product
+Psi_sg = np.ones((m_sg, N_basis))
+for n in range(N_basis):
+    for k in range(d):  # k=0 to 10 for all 11 parameters
+        Pk = legendre(Lambda[n, k])
+        norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+        Psi_sg[:, n] *= norm * Pk(xi_can[:, k])
+
+# 6. SG Gram Matrix and Coefficients
+G_sg = Psi_sg.T @ (w_can[:, None] * Psi_sg)
+coeff_sg = Psi_sg.T @ (w_can[:, None] * F_sg)
+
+diag_err = np.max(np.abs(np.diag(G_sg) - 1.0))
+offdiag_err = np.max(np.abs(G_sg - np.diag(np.diag(G_sg))))
+print(f"SG Gram matrix - Diagonal error: {diag_err:.2e}, Off-diagonal error: {offdiag_err:.2e}")
+
+# =============================================================================
+# LEARNING CURVE ANALYSIS
+# =============================================================================
+
+# Training sample sizes to test
+train_sizes = list(range(50, 2001, 50))  # 50, 100, 150, ..., 1000
+print(f"Training sizes to test: {train_sizes}")
+
+# Storage for learning curve results
+learning_curve_results = {
+    'train_sizes': train_sizes,
+    'l2_errors_weighted': [],
+    'l2_errors_unweighted': [],
+    'sparsity_weighted': [],
+    'sparsity_unweighted': [],
+    'solve_times': []
+}
+
+output_names = ['PCP', 'ACC', 'LWP', 'IWP', 'OLR', 'OSR']
+
+# Generate maximum training set once
+m_train_max = max(train_sizes)
+x_train_max = np.random.uniform(pmin, pmax, size=(m_train_max, d))
+xi_train_max = map_to_canonical(x_train_max)
+
+print(f"Generating {m_train_max} training samples...")
+runs_train_max = [[input_file, output_file, namelist_file, i+1, x_train_max[i].tolist()] for i in range(m_train_max)]
+F_train_max_full = np.array(pmap(runcrm, runs_train_max))
+F_train_max = F_train_max_full[:, 18:24]
+
+# Learning curve loop
+for train_size in train_sizes:
+    print(f"\n{'='*60}")
+    print(f"Training with {train_size} samples")
+    print(f"{'='*60}")
+    
+    # Use subset of training data
+    x_train = x_train_max[:train_size]
+    xi_train = xi_train_max[:train_size]
+    F_train = F_train_max[:train_size]
+    
+    # Build A matrix for current training size
+    A = np.ones((train_size, N_basis))
+    for n in range(N_basis):
+        for k in range(d):  # k=0 to 10 for all 11 parameters
+            Pk = legendre(Lambda[n, k])
+            norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+            A[:, n] *= norm * Pk(xi_train[:, k])
+
+    A /= np.sqrt(train_size)
+    b = F_train / np.sqrt(train_size)
+
+    # Regularization parameters
+    L = np.log(train_size) * (np.log(train_size) + np.log(1/0.05))
+    mu_val_book = 1 / (4 * np.sqrt(train_size) / L)
+    mu_val = 1e-5  # Keep original
+    
+    # Create diagonal weight matrix
+    W = np.diag(weights)
+    
+    # Initialize coefficient arrays
+    xhat_lasso_weighted = np.zeros((N_basis, K))
+    xhat_lasso_unweighted = np.zeros((N_basis, K))
+    
+    start_time_solver = time.time()
+    
+    # Solve both weighted and unweighted SR-LASSO
+    for k in range(K):
+        # Weighted SR-LASSO
+        x_SR_LASSO_weighted = cp.Variable((N_basis,))
+        objective_weighted = cp.Minimize(mu_val * cp.norm(W @ x_SR_LASSO_weighted, 1) + cp.norm(A @ x_SR_LASSO_weighted - b[:, k], 2))
+        problem_weighted = cp.Problem(objective_weighted)
+        problem_weighted.solve(solver=cp.CLARABEL)
+        xhat_lasso_weighted[:, k] = x_SR_LASSO_weighted.value
+        
+        # Unweighted SR-LASSO
+        x_SR_LASSO_unweighted = cp.Variable((N_basis,))
+        objective_unweighted = cp.Minimize(mu_val * cp.norm(x_SR_LASSO_unweighted, 1) + cp.norm(A @ x_SR_LASSO_unweighted - b[:, k], 2))
+        problem_unweighted = cp.Problem(objective_unweighted)
+        problem_unweighted.solve(solver=cp.CLARABEL)
+        xhat_lasso_unweighted[:, k] = x_SR_LASSO_unweighted.value
+    
+    end_time_solver = time.time()
+    solve_time = end_time_solver - start_time_solver
+    
+    print(f"✔️ SR-LASSO problems solved in {solve_time:.2f} seconds")
+    
+    # =============================================================================
+    # L2 Relative Error Computation on SG Points
+    # =============================================================================
+    
+    # Physical integration weights for 11D
+    volume_phys_11d = np.prod(pmax - pmin)
+    w_phys = w_can * (volume_phys_11d / (2**d))  # 11D: divide by 2^11
+    w_pos = np.abs(w_phys)
+    
+    # Build evaluation matrix on SG points
+    Psi_SG_eval = np.ones((m_sg, N_basis))
+    for n in range(N_basis):
+        for k in range(d):
+            Pk = legendre(Lambda[n, k])
+            norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+            Psi_SG_eval[:, n] *= norm * Pk(xi_can[:, k])
+    
+    # Evaluate surrogates on SG points
+    y_SG_eval_weighted = Psi_SG_eval @ xhat_lasso_weighted
+    y_SG_eval_unweighted = Psi_SG_eval @ xhat_lasso_unweighted
+    y_true_SG = F_sg
+    
+    # Compute L2 relative errors
+    l2_rel_error_weighted = np.zeros(K)
+    l2_rel_error_unweighted = np.zeros(K)
+    
+    for k in range(K):
+        # Weighted errors
+        diff_weighted = y_true_SG[:, k] - y_SG_eval_weighted[:, k]
+        num_sq_weighted = np.dot(diff_weighted**2, w_pos)
+        denom_sq = np.dot(y_true_SG[:, k]**2, w_pos)
+        if denom_sq <= 0:
+            l2_rel_error_weighted[k] = np.nan
+        else:
+            l2_rel_error_weighted[k] = np.sqrt(num_sq_weighted) / np.sqrt(denom_sq)
+        
+        # Unweighted errors
+        diff_unweighted = y_true_SG[:, k] - y_SG_eval_unweighted[:, k]
+        num_sq_unweighted = np.dot(diff_unweighted**2, w_pos)
+        if denom_sq <= 0:
+            l2_rel_error_unweighted[k] = np.nan
+        else:
+            l2_rel_error_unweighted[k] = np.sqrt(num_sq_unweighted) / np.sqrt(denom_sq)
+    
+    # Calculate sparsity
+    sparsity_weighted = [np.count_nonzero(np.abs(xhat_lasso_weighted[:, k]) > 1e-12) for k in range(K)]
+    sparsity_unweighted = [np.count_nonzero(np.abs(xhat_lasso_unweighted[:, k]) > 1e-12) for k in range(K)]
+    
+    # Store results
+    learning_curve_results['l2_errors_weighted'].append(l2_rel_error_weighted.copy())
+    learning_curve_results['l2_errors_unweighted'].append(l2_rel_error_unweighted.copy())
+    learning_curve_results['sparsity_weighted'].append(sparsity_weighted)
+    learning_curve_results['sparsity_unweighted'].append(sparsity_unweighted)
+    learning_curve_results['solve_times'].append(solve_time)
+    
+    print(f"L2 Relative Errors:")
+    print(f"  Weighted:   {l2_rel_error_weighted}")
+    print(f"  Unweighted: {l2_rel_error_unweighted}")
+    print(f"Average L2 Error:")
+    print(f"  Weighted:   {np.mean(l2_rel_error_weighted):.6f}")
+    print(f"  Unweighted: {np.mean(l2_rel_error_unweighted):.6f}")
+
+# =============================================================================
+# LEARNING CURVE VISUALIZATION
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("LEARNING CURVE ANALYSIS COMPLETE")
+print(f"{'='*80}")
+
+# Convert results to numpy arrays for easier plotting
+l2_errors_weighted_array = np.array(learning_curve_results['l2_errors_weighted'])
+l2_errors_unweighted_array = np.array(learning_curve_results['l2_errors_unweighted'])
+
+# Plot learning curves for each output
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+axes = axes.flatten()
+
+for k in range(K):
+    ax = axes[k]
+    
+    # Plot learning curves
+    ax.loglog(train_sizes, l2_errors_weighted_array[:, k], 'o-', 
+             label='Weighted SR-LASSO', color='blue', linewidth=2, markersize=6)
+    ax.loglog(train_sizes, l2_errors_unweighted_array[:, k], 's-', 
+             label='Unweighted SR-LASSO', color='red', linewidth=2, markersize=6)
+    
+    ax.set_xlabel('Training Sample Size')
+    ax.set_ylabel('L2 Relative Error')
+    ax.set_title(f'Learning Curve: {output_names[k]}')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add theoretical decay line for reference
+    theoretical_decay = 0.1 * (np.array(train_sizes) / train_sizes[0])**(-0.5)
+    ax.loglog(train_sizes, theoretical_decay, '--', color='gray', alpha=0.7, label='m^(-1/2) reference')
+
+plt.tight_layout()
+plt.show()
+
+# Plot average learning curve
+fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+avg_l2_weighted = np.mean(l2_errors_weighted_array, axis=1)
+avg_l2_unweighted = np.mean(l2_errors_unweighted_array, axis=1)
+
+ax.loglog(train_sizes, avg_l2_weighted, 'o-', 
+         label='Weighted SR-LASSO (Average)', color='blue', linewidth=3, markersize=8)
+ax.loglog(train_sizes, avg_l2_unweighted, 's-', 
+         label='Unweighted SR-LASSO (Average)', color='red', linewidth=3, markersize=8)
+
+# Add theoretical decay line
+theoretical_decay = 0.1 * (np.array(train_sizes) / train_sizes[0])**(-0.5)
+ax.loglog(train_sizes, theoretical_decay, '--', color='gray', alpha=0.7, 
+         label='m^(-1/2) reference', linewidth=2)
+
+ax.set_xlabel('Training Sample Size', fontsize=14)
+ax.set_ylabel('Average L2 Relative Error', fontsize=14)
+ax.set_title('Average Learning Curve: All Outputs', fontsize=16)
+ax.legend(fontsize=12)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Plot sparsity evolution
+sparsity_weighted_array = np.array(learning_curve_results['sparsity_weighted'])
+sparsity_unweighted_array = np.array(learning_curve_results['sparsity_unweighted'])
+
+fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+avg_sparsity_weighted = np.mean(sparsity_weighted_array, axis=1)
+avg_sparsity_unweighted = np.mean(sparsity_unweighted_array, axis=1)
+
+ax.plot(train_sizes, avg_sparsity_weighted, 'o-', 
+        label='Weighted SR-LASSO', color='blue', linewidth=2, markersize=6)
+ax.plot(train_sizes, avg_sparsity_unweighted, 's-', 
+        label='Unweighted SR-LASSO', color='red', linewidth=2, markersize=6)
+
+ax.set_xlabel('Training Sample Size', fontsize=14)
+ax.set_ylabel('Average Number of Nonzero Coefficients', fontsize=14)
+ax.set_title('Sparsity Evolution with Training Size', fontsize=16)
+ax.legend(fontsize=12)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Summary table
+print(f"\nLEARNING CURVE SUMMARY:")
+print(f"{'Train Size':<12} {'Weighted Avg':<15} {'Unweighted Avg':<17} {'Improvement':<12} {'Solve Time':<12}")
+print(f"{'-'*80}")
+
+for i, train_size in enumerate(train_sizes):
+    weighted_avg = np.mean(l2_errors_weighted_array[i])
+    unweighted_avg = np.mean(l2_errors_unweighted_array[i])
+    improvement = (unweighted_avg - weighted_avg) / unweighted_avg * 100
+    solve_time = learning_curve_results['solve_times'][i]
+    
+    print(f"{train_size:<12} {weighted_avg:<15.6f} {unweighted_avg:<17.6f} {improvement:<12.2f}% {solve_time:<12.2f}s")
+
+print(f"\nFinal Summary:")
+print(f"- Parameter space: 11D (all parameters)")
+print(f"- Basis size: {N_basis}")
+print(f"- SG grid size: {m_sg}")
+print(f"- Training sizes tested: {len(train_sizes)}")
+print(f"- Final training size: {max(train_sizes)}")
+print(f"- Best weighted average error: {np.min(avg_l2_weighted):.6f}")
+print(f"- Best unweighted average error: {np.min(avg_l2_unweighted):.6f}")
+print(f"- Average improvement with weighting: {np.mean([(unweighted_avg - weighted_avg) / unweighted_avg * 100 for weighted_avg, unweighted_avg in zip(avg_l2_weighted, avg_l2_unweighted)]):.2f}%")
