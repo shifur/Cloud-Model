@@ -241,23 +241,6 @@ for train_size in train_sizes:
         else:
             l2_rel_error_unweighted[k] = np.sqrt(num_sq_unweighted) / np.sqrt(denom_sq)
     
-    # Calculate sparsity
-    sparsity_weighted = [np.count_nonzero(np.abs(xhat_lasso_weighted[:, k]) > 1e-12) for k in range(K)]
-    sparsity_unweighted = [np.count_nonzero(np.abs(xhat_lasso_unweighted[:, k]) > 1e-12) for k in range(K)]
-    
-    # Store results
-    learning_curve_results['l2_errors_weighted'].append(l2_rel_error_weighted.copy())
-    learning_curve_results['l2_errors_unweighted'].append(l2_rel_error_unweighted.copy())
-    learning_curve_results['sparsity_weighted'].append(sparsity_weighted)
-    learning_curve_results['sparsity_unweighted'].append(sparsity_unweighted)
-    learning_curve_results['solve_times'].append(solve_time)
-    
-    print(f"L2 Relative Errors:")
-    print(f"  Weighted:   {l2_rel_error_weighted}")
-    print(f"  Unweighted: {l2_rel_error_unweighted}")
-    print(f"Average L2 Error:")
-    print(f"  Weighted:   {np.mean(l2_rel_error_weighted):.6f}")
-    print(f"  Unweighted: {np.mean(l2_rel_error_unweighted):.6f}")
 
 # =============================================================================
 # LEARNING CURVE VISUALIZATION
@@ -321,49 +304,3 @@ ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.show()
-
-# Plot sparsity evolution
-sparsity_weighted_array = np.array(learning_curve_results['sparsity_weighted'])
-sparsity_unweighted_array = np.array(learning_curve_results['sparsity_unweighted'])
-
-fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-
-avg_sparsity_weighted = np.mean(sparsity_weighted_array, axis=1)
-avg_sparsity_unweighted = np.mean(sparsity_unweighted_array, axis=1)
-
-ax.plot(train_sizes, avg_sparsity_weighted, 'o-', 
-        label='Weighted SR-LASSO', color='blue', linewidth=2, markersize=6)
-ax.plot(train_sizes, avg_sparsity_unweighted, 's-', 
-        label='Unweighted SR-LASSO', color='red', linewidth=2, markersize=6)
-
-ax.set_xlabel('Training Sample Size', fontsize=14)
-ax.set_ylabel('Average Number of Nonzero Coefficients', fontsize=14)
-ax.set_title('Sparsity Evolution with Training Size', fontsize=16)
-ax.legend(fontsize=12)
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-# Summary table
-print(f"\nLEARNING CURVE SUMMARY:")
-print(f"{'Train Size':<12} {'Weighted Avg':<15} {'Unweighted Avg':<17} {'Improvement':<12} {'Solve Time':<12}")
-print(f"{'-'*80}")
-
-for i, train_size in enumerate(train_sizes):
-    weighted_avg = np.mean(l2_errors_weighted_array[i])
-    unweighted_avg = np.mean(l2_errors_unweighted_array[i])
-    improvement = (unweighted_avg - weighted_avg) / unweighted_avg * 100
-    solve_time = learning_curve_results['solve_times'][i]
-    
-    print(f"{train_size:<12} {weighted_avg:<15.6f} {unweighted_avg:<17.6f} {improvement:<12.2f}% {solve_time:<12.2f}s")
-
-print(f"\nFinal Summary:")
-print(f"- Parameter space: 11D (all parameters)")
-print(f"- Basis size: {N_basis}")
-print(f"- SG grid size: {m_sg}")
-print(f"- Training sizes tested: {len(train_sizes)}")
-print(f"- Final training size: {max(train_sizes)}")
-print(f"- Best weighted average error: {np.min(avg_l2_weighted):.6f}")
-print(f"- Best unweighted average error: {np.min(avg_l2_unweighted):.6f}")
-print(f"- Average improvement with weighting: {np.mean([(unweighted_avg - weighted_avg) / unweighted_avg * 100 for weighted_avg, unweighted_avg in zip(avg_l2_weighted, avg_l2_unweighted)]):.2f}%")
