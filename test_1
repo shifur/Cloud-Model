@@ -1,0 +1,243 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import legendre
+import sys
+import time
+
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+
+import Tasmanian
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+# =============================================================================
+# OPTIMIZED ALGORITHMS 2 & 5 
+# =============================================================================
+
+def primal_dual_weighted_sr_lasso(A, b, w, lambda_param, tau, sigma, T, x_init=None, y_init=None):
+    m, N = A.shape
+    x = np.copy(x_init) if x_init is not None else np.zeros(N)
+    y = np.copy(y_init) if y_init is not None else np.zeros(m)
+    x_bar = np.zeros(N)
+    for n in range(T):
+        p = x - tau * A.T @ y
+        x_new = np.sign(p) * np.maximum(np.abs(p) - tau * lambda_param * w, 0)
+        q = y + sigma * A @ (2 * x_new - x) - sigma * b
+        norm_q = np.linalg.norm(q)
+        y_new = q / norm_q if norm_q > 1.0 else q
+        x_bar = (n / (n + 1)) * x_bar + (1 / (n + 1)) * x_new  # ergodic update
+        x, y = x_new, y_new
+    return x
+
+
+def restarted_primal_dual_weighted_sr_lasso(A, b, w, lambda_param, T_inner, R, eps_0, r, s, tau, sigma):
+    m, N = A.shape
+    x_tilde = np.zeros(N)
+    eps_l = np.linalg.norm(b)
+    for l in range(R):
+        eps_l = r * (eps_l + eps_0)
+        a_l = s * eps_l
+        if a_l > 1e-15:
+            x_init_scaled = x_tilde / a_l if np.linalg.norm(x_tilde) > 0 else np.zeros(N)
+            b_scaled = b / a_l
+            x_result = primal_dual_weighted_sr_lasso(
+                A, b_scaled, w, lambda_param, tau, sigma, T_inner,
+                x_init_scaled, np.zeros(m)
+            )
+            x_tilde = a_l * x_result
+    return x_tilde
+
+# =============================================================================
+# ATMOSPHERIC MODELING CODE WITH WEIGHTED SR-LASSO ONLY
+# =============================================================================
+
+np.random.seed(42)
+d = 11
+K = 6
+pmin = np.array([50.0, 0.10, 50.0, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1e-4, 2e-6])
+pmax = np.array([1000.0, 1.0, 1200.0, 0.90, 5.0, 2.5, 2.5, 1.0, 1.0, 2e-3, 1e-3])
+xnames = ['as','bs','ag','bg','N0r','N0s','N0g','rhos','rhog','qc0','qi0']
+
+volume_phys = np.prod(pmax - pmin)
+def map_to_canonical(X): return 2 * (X - pmin) / (pmax - pmin) - 1
+
+HCfunc = lambda x: np.prod(x + 1) - 1
+p_poly = 20
+
+def multiidx_gen(N, rule, w, base=0, idx=np.array([]), M=np.array([])):
+    if len(idx) != N:
+        i = base
+        while rule(np.append(idx, i)) <= w:
+            M = multiidx_gen(N, rule, w, base, np.append(idx, i), M)
+            i += 1
+    else:
+        M = np.vstack([M, idx]) if M.size else idx
+    return M
+
+Lambda = multiidx_gen(d, HCfunc, p_poly).astype(int)
+N_basis = Lambda.shape[0]
+
+def compute_intrinsic_weights_legendre(Lambda):
+    weights = np.ones(Lambda.shape[0])
+    for n in range(Lambda.shape[0]):
+        for k in range(Lambda.shape[1]):
+            weights[n] *= np.sqrt(2 * Lambda[n, k] + 1)
+    return weights
+
+weights = compute_intrinsic_weights_legendre(Lambda)
+
+grid = Tasmanian.SparseGrid()
+grid.makeGlobalGrid(d, 0, 3, "level", "clenshaw-curtis")
+grid.clearDomainTransform()
+xi_can = grid.getPoints()
+w_can = grid.getQuadratureWeights()
+m_sg = xi_can.shape[0]
+
+x_phys_sg = 0.5 * (xi_can + 1) * (pmax - pmin) + pmin
+runs_sg = [[ './cloud_column_model/run_one_crm1d.txt', './cloud_column_model/crm1d_output.txt', './cloud_column_model/namelist_3h_t30-180.f90', i+1, x_phys_sg[i].tolist()] for i in range(m_sg)]
+pmap = parmap.Parmap(master='scispark6.jpl.nasa.gov:8786', mode='par', numWorkers=12)
+F_sg_full = np.array(pmap(runcrm, runs_sg))
+F_sg = F_sg_full[:, 18:24]
+
+Psi_sg = np.ones((m_sg, N_basis))
+for n in range(N_basis):
+    for k in range(d):
+        Pk = legendre(Lambda[n, k])
+        norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+        Psi_sg[:, n] *= norm * Pk(xi_can[:, k])
+
+w_pos = np.abs(w_can * (volume_phys / (2**d)))
+
+# =============================================================================
+# LEARNING CURVE ANALYSIS WITH UPDATED PD/PDR PARAMETERS
+# =============================================================================
+
+train_sizes = list(range(50, 2001, 50))
+learning_curve_results = {
+    'train_sizes': train_sizes,
+    'l2_errors_pd': [],
+    'l2_errors_pdr': [],
+    'solve_times_pd': [],
+    'solve_times_pdr': []
+}
+
+m_train_max = max(train_sizes)
+x_train_max = np.random.uniform(pmin, pmax, size=(m_train_max, d))
+xi_train_max = map_to_canonical(x_train_max)
+runs_train_max = [[ './cloud_column_model/run_one_crm1d.txt', './cloud_column_model/crm1d_output.txt', './cloud_column_model/namelist_3h_t30-180.f90', i+1, x_train_max[i].tolist()] for i in range(m_train_max)]
+F_train_max = np.array(pmap(runcrm, runs_train_max))[:, 18:24]
+
+for m in train_sizes:
+    x_sub = x_train_max[:m]
+    xi_sub = xi_train_max[:m]
+    F_sub = F_train_max[:m]
+    A = np.ones((m, N_basis))
+    for n in range(N_basis):
+        for k in range(d):
+            Pk = legendre(Lambda[n, k])
+            norm = np.sqrt((2 * Lambda[n, k] + 1) / 2)
+            A[:, n] *= norm * Pk(xi_sub[:, k])
+    A /= np.sqrt(m)
+    b = F_sub / np.sqrt(m)
+
+        # =============================================================================
+    # Algorithm parameters (Table 4.3 settings)
+    # Regularization and restart tolerance
+    lambda_param = 1.0 / np.sqrt(25 * m)
+    eps0 = lambda_param
+
+    # Compute L(m,d,ε₀) via Eq. (3.8): L = √(2/m)·d·ln(3d/ε₀)
+    def compute_L(m, d, eps0):
+        return np.sqrt(2.0/m) * d * np.log(3.0 * d / eps0)
+    L_val = compute_L(m, d, eps0)
+
+    # Step-sizes τ=σ as ν^α, ν=N_basis, α=√2
+    alpha_exp = np.sqrt(2.0)
+    tau = sigma = N_basis ** alpha_exp
+
+    # Total PD iterations: T = ceil(d^2·ν^α·e)
+    T_basic   = int(np.ceil(d**2 * (N_basis ** alpha_exp) * np.e))
+    # Use same inner budget for PDR
+    T_inner   = T_basic
+    # Single restart to cover budget
+    R_restarts = 1
+
+    # Restart scales
+    r = np.exp(-1)
+    # s = ceil(d·sqrt(m/(4·c0·L))) with c0≈1
+    c0 = 1.0
+    s = int(np.ceil(d * np.sqrt(m / (4.0 * c0 * L_val))))
+
+    # Solve
+    t0 = time.time()
+    for k in range(K):
+        xhat_pd = primal_dual_weighted_sr_lasso(A, b[:, k], weights, lambda_param, tau, sigma, T_basic)
+    t_pd = time.time() - t0
+
+    t0 = time.time()
+    for k in range(K):
+        xhat_pdr = restarted_primal_dual_weighted_sr_lasso(A, b[:, k], weights, lambda_param, T_inner, R_restarts, eps0, r, s, tau, sigma)
+    t_pdr = time.time() - t0
+
+    # Error
+    errs_pd = []
+    errs_pdr = []
+    for k in range(K):
+        y_pd = Psi_sg @ xhat_pd
+        y_pdr = Psi_sg @ xhat_pdr
+        denom = np.dot(F_sg[:, k]**2, w_pos)
+        errs_pd.append(np.sqrt(np.dot((F_sg[:, k] - y_pd[:, k])**2, w_pos) / denom))
+        errs_pdr.append(np.sqrt(np.dot((F_sg[:, k] - y_pdr[:, k])**2, w_pos) / denom))
+
+    learning_curve_results['l2_errors_pd'].append(errs_pd)
+    learning_curve_results['l2_errors_pdr'].append(errs_pdr)
+    learning_curve_results['solve_times_pd'].append(t_pd)
+    learning_curve_results['solve_times_pdr'].append(t_pdr)
+
+# =============================================================================
+# VISUALIZATIONS
+# =============================================================================
+
+# 1) Per-output learning curves
+l2_pd_arr  = np.array(learning_curve_results['l2_errors_pd'])
+l2_pdr_arr= np.array(learning_curve_results['l2_errors_pdr'])
+fig, axs = plt.subplots(2,3,figsize=(18,12))
+for i, ax in enumerate(axs.flatten()):
+    ax.loglog(train_sizes, l2_pd_arr[:, i], 'o-', label='PD')
+    ax.loglog(train_sizes, l2_pdr_arr[:, i], 's-', label='PDR')
+    ref = 0.1 * (np.array(train_sizes)/train_sizes[0])**(-0.5)
+    ax.loglog(train_sizes, ref, '--', color='gray', label='m^(-1/2)')
+    ax.set_title(output_names[i]); ax.set_xlabel('m'); ax.set_ylabel('L2 rel error'); ax.legend(); ax.grid(alpha=0.3)
+plt.suptitle('11D Learning Curves'); plt.tight_layout(); plt.show()
+
+# 2) Average learning curve
+avg_pd = l2_pd_arr.mean(axis=1); avg_pdr = l2_pdr_arr.mean(axis=1)
+fig, ax = plt.subplots(figsize=(10,6))
+ax.loglog(train_sizes, avg_pd, 'o-', label='PD(avg)')
+ax.loglog(train_sizes, avg_pdr,'s-', label='PDR(avg)')
+ax.loglog(train_sizes, ref, '--', color='gray', label='m^(-1/2)')
+ax.set_xlabel('m'); ax.set_ylabel('Avg L2 rel error'); ax.set_title('Average Learning Curve'); ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+
+# 3) Figure 5.5 style using the same train_sizes
+m_vals = np.array(train_sizes)
+err_pd  = avg_pd; err_pdr = avg_pdr
+sigma_pd  = np.std(np.log(l2_pd_arr), axis=1)
+sigma_pdr = np.std(np.log(l2_pdr_arr),axis=1)
+t_pd = np.array(learning_curve_results['solve_times_pd'])
+t_pdr= np.array(learning_curve_results['solve_times_pdr'])
+
+fig, (e_ax, r_ax) = plt.subplots(1,2,figsize=(14,5))
+# Error decay
+e_ax.semilogy(m_vals, err_pd, 'o-', label='PD')
+e_ax.fill_between(m_vals, err_pd*np.exp(-sigma_pd), err_pd*np.exp(sigma_pd), alpha=0.2)
+e_ax.semilogy(m_vals, err_pdr,'s-', label='PDR')
+e_ax.fill_between(m_vals, err_pdr*np.exp(-sigma_pdr), err_pdr*np.exp(sigma_pdr), alpha=0.2)
+e_ax.set_xlabel('m'); e_ax.set_ylabel('Avg L2 rel error'); e_ax.set_title('Fig 5.5 Error decay'); e_ax.legend(); e_ax.grid(alpha=0.3)
+# Runtime scaling
+r_ax.plot(m_vals, t_pd,'o-',label='PD'); r_ax.plot(m_vals, t_pdr,'s-',label='PDR')
+coef_pd  = np.polyfit(m_vals, t_pd,1); coef_pdr = np.polyfit(m_vals, t_pdr,1)
+r_ax.plot(m_vals, np.poly1d(coef_pd)(m_vals),'--',label=f'PD fit: {coef_pd[0]:.3g}s')
+r_ax.plot(m_vals, np.poly1d(coef_pdr)(m_vals),'--',label=f'PDR fit: {coef_pdr[0]:.3g}s')
+r_ax.set_xlabel('m'); r_ax.set_ylabel('Runtime (s)'); r_ax.set_title('Fig 5.5 Runtime'); r_ax.legend(); r_ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
