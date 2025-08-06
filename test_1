@@ -155,12 +155,15 @@ for m in train_sizes:
     alpha_exp = np.sqrt(2.0)
     tau = sigma = N_basis ** alpha_exp
 
-    # Total PD iterations: T = ceil(d^2·ν^α·e)
+        # Total PD iterations: T = ceil(d^2·ν^α·e)
     T_basic   = int(np.ceil(d**2 * (N_basis ** alpha_exp) * np.e))
     # Use same inner budget for PDR
     T_inner   = T_basic
-    # Single restart to cover budget
-    R_restarts = 1
+    # Total budget for restarted PD iterations
+    total_budget = 1000
+    # How many inner loops we need so that total steps ≈1000
+    # If each inner loop has T_inner steps, then repeating it R_restarts times gives ≈1000 total
+    R_restarts = max(1, total_budget // T_inner)
 
     # Restart scales
     r = np.exp(-1)
