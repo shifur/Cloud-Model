@@ -112,7 +112,7 @@ w_pos = np.abs(w_can * (volume_phys / (2**d)))
 # LEARNING CURVE ANALYSIS WITH UPDATED PD/PDR PARAMETERS
 # =============================================================================
 
-train_sizes = list(range(50, 2001, 50))
+train_sizes = list(range(100, 2001, 100))
 learning_curve_results = {
     'train_sizes': train_sizes,
     'l2_errors_pd': [],
