@@ -1,0 +1,142 @@
+import numpy as np
+
+# Set up the same base parameters as in your code
+np.random.seed(42)
+d = 11  # dimensions
+K = 6   # outputs
+m = 1000 # training size
+
+# Hyperbolic cross polynomial parameters
+HCfunc = lambda x: np.prod(x + 1) - 1
+p_poly = 20
+
+# Generate multi-index set (simplified version of your multiidx_gen)
+def multiidx_gen(N, rule, w, base=0, idx=np.array([]), M=np.array([])):
+    if len(idx) != N:
+        i = base
+        while rule(np.append(idx, i)) <= w:
+            M = multiidx_gen(N, rule, w, base, np.append(idx, i), M)
+            i += 1
+    else:
+        M = np.vstack([M, idx]) if M.size else idx
+    return M
+
+Lambda = multiidx_gen(d, HCfunc, p_poly).astype(int)
+N_basis = Lambda.shape[0] =4291
+
+print("="*70)
+print("PARAMETER COMPARISON FOR TRAINING SIZE m = 1000")
+print("="*70)
+print(f"Basis size N = {N_basis}")
+print(f"Dimensions d = {d}")
+print(f"Training size m = {m}")
+print()
+
+# Common parameters
+lambda_param = 1.0 / np.sqrt(25 * m)
+eps0 = lambda_param
+
+print(f"Common parameters:")
+print(f"  λ = 1/√(25m) = 1/√(25×{m}) = {lambda_param:.6f}")
+print(f"  ε₀ = λ = {eps0:.6f}")
+print()
+
+print("="*70)
+print("VERSION 1: Figure 5.1 settings (paste.txt)")
+print("="*70)
+
+# VERSION 1: Figure 5.1 settings
+normA = 0.107790  # Approximation (typically ||A|| ≈ 1 after normalization)
+print(f"Assumptions: ||A|| ≈ {normA}")
+print()
+
+tau_v1 = sigma_v1 = 1.0 / normA
+T_basic_v1 = 1000
+T_inner_v1 = int(np.ceil(2 * normA * np.e))
+R_restarts_v1 = T_basic_v1 // T_inner_v1
+r_v1 = np.exp(-1)
+s_v1 = T_inner_v1 / (2 * normA)
+
+print(f"Step sizes:")
+print(f"  τ = σ = 1/||A|| = 1/{normA} = {tau_v1}")
+print()
+print(f"Iterations:")
+print(f"  T_basic = {T_basic_v1}")
+print(f"  T_inner = ⌈2×||A||×e⌉ = ⌈2×{normA}×{np.e:.3f}⌉ = {T_inner_v1}")
+print(f"  R_restarts = T_basic // T_inner = {T_basic_v1} // {T_inner_v1} = {R_restarts_v1}")
+print(f"  Total iterations = T_inner × R = {T_inner_v1} × {R_restarts_v1} = {T_inner_v1 * R_restarts_v1}")
+print()
+print(f"Restart parameters:")
+print(f"  r = e⁻¹ = {r_v1:.6f}")
+print(f"  s = T_inner/(2×||A||) = {T_inner_v1}/(2×{normA}) = {s_v1}")
+
+print()
+print("="*70)
+print("VERSION 2: Table 4.3 settings (paste-2.txt)")
+print("="*70)
+
+# VERSION 2: Table 4.3 settings
+# Compute L(m,d,ε₀) via Eq. (3.8): L = √(2/m)·d·ln(3d/ε₀)
+def compute_L(m, d, eps0):
+    return np.sqrt(2.0/m) * d * np.log(3.0 * d / eps0)
+
+L_val = compute_L(m, d, eps0)
+print(f"L(m,d,ε₀) computation:")
+print(f"  L = √(2/m)×d×ln(3d/ε₀)")
+print(f"    = √(2/{m})×{d}×ln(3×{d}/{eps0:.6f})")
+print(f"    = {np.sqrt(2.0/m):.6f}×{d}×ln({3*d/eps0:.1f})")
+print(f"    = {np.sqrt(2.0/m):.6f}×{d}×{np.log(3.0 * d / eps0):.6f}")
+print(f"    = {L_val:.6f}")
+print()
+
+# Step-sizes τ=σ as ν^α, ν=N_basis, α=√2
+alpha_exp = np.sqrt(2.0)
+tau_v2 = sigma_v2 = N_basis ** alpha_exp
+print(f"Step sizes:")
+print(f"  α = √2 = {alpha_exp:.6f}")
+print(f"  τ = σ = N^α = {N_basis}^{alpha_exp:.3f} = {tau_v2:.3g}")
+print()
+
+# Total PD iterations: T = ceil(d^2·ν^α·e)
+T_basic_v2 = int(np.ceil(d**2 * (N_basis ** alpha_exp) * np.e))
+T_inner_v2 = T_basic_v2
+total_budget = 1000
+R_restarts_v2 = max(1, total_budget // T_inner_v2)
+
+print(f"Iterations:")
+print(f"  T_basic = ⌈d²×N^α×e⌉")
+print(f"          = ⌈{d}²×{N_basis}^{alpha_exp:.3f}×{np.e:.3f}⌉")
+print(f"          = ⌈{d**2}×{N_basis**alpha_exp:.3g}×{np.e:.3f}⌉")
+print(f"          = ⌈{d**2 * (N_basis ** alpha_exp) * np.e:.3g}⌉")
+print(f"          = {T_basic_v2:,}")
+print(f"  T_inner = T_basic = {T_inner_v2:,}")
+print(f"  R_restarts = max(1, {total_budget} // {T_inner_v2:,}) = {R_restarts_v2}")
+print(f"  Total iterations = T_inner × R = {T_inner_v2:,} × {R_restarts_v2} = {T_inner_v2 * R_restarts_v2:,}")
+print()
+
+# s = ceil(d·sqrt(m/(4·c0·L))) with c0≈1
+c0 = 1.0
+s_v2 = int(np.ceil(d * np.sqrt(m / (4.0 * c0 * L_val))))
+r_v2 = np.exp(-1)
+
+print(f"Restart parameters:")
+print(f"  c₀ = {c0}")
+print(f"  s = ⌈d×√(m/(4×c₀×L))⌉")
+print(f"    = ⌈{d}×√({m}/(4×{c0}×{L_val:.6f}))⌉")
+print(f"    = ⌈{d}×√({m/(4.0*c0*L_val):.6f})⌉")
+print(f"    = ⌈{d}×{np.sqrt(m / (4.0 * c0 * L_val)):.6f}⌉")
+print(f"    = {s_v2}")
+print(f"  r = e⁻¹ = {r_v2:.6f}")
+
+print()
+print("="*70)
+print("SUMMARY COMPARISON")
+print("="*70)
+
+print(f"{'Parameter':<15} {'Version 1':<15} {'Version 2':<15} {'Ratio (V2/V1)':<15}")
+print("-"*70)
+print(f"{'τ = σ':<15} {tau_v1:<15.3g} {tau_v2:<15.3g} {tau_v2/tau_v1:<15.1f}")
+print(f"{'T_inner':<15} {T_inner_v1:<15,} {T_inner_v2:<15,} {T_inner_v2/T_inner_v1:<15.1f}")
+print(f"{'R_restarts':<15} {R_restarts_v1:<15} {R_restarts_v2:<15} {R_restarts_v2/R_restarts_v1:<15.3f}")
+print(f"{'Total iters':<15} {T_inner_v1*R_restarts_v1:<15,} {T_inner_v2*R_restarts_v2:<15,} {(T_inner_v2*R_restarts_v2)/(T_inner_v1*R_restarts_v1):<15.1f}")
+print(f"{'s':<15} {s_v1:<15.1f} {s_v2:<15} {s_v2/s_v1:<15.1f}")
