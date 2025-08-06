@@ -1,0 +1,386 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import sys
+import itertools
+import warnings
+warnings.filterwarnings("ignore", message="Glyph.*missing from font")
+
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+import Tasmanian
+
+# =============================================================================
+# EXACT Algorithm 2 Implementation (from pseudocode)
+# =============================================================================
+
+def algorithm_2_exact(A, B, w, lambda_param, tau, sigma, T, C_init, Lambda_init):
+    """
+    EXACT Algorithm 2: primal-dual-wSRLASSO-C
+    Following the pseudocode line by line for K=1 (scalar case)
+    """
+    m, N = A.shape
+    
+    # Step: initialize C_bar^(0) = 0
+    C_bar = np.zeros(N)
+    C = np.copy(C_init)
+    Lambda = np.copy(Lambda_init)
+    
+    error_history_iter = []
+    error_history_ergodic = []
+    
+    # Main loop: for n = 0, 1, ..., T-1
+    for n in range(T):
+        # Step 2: P = C^(n) - tau * A^T * Lambda^(n)
+        P = C - tau * A.T @ Lambda
+        
+        # Step 3-6: Weighted soft thresholding
+        C_next = np.zeros(N)
+        for i in range(N):
+            if np.abs(P[i]) > tau * lambda_param * w[i]:
+                C_next[i] = np.sign(P[i]) * (np.abs(P[i]) - tau * lambda_param * w[i])
+            else:
+                C_next[i] = 0.0
+        
+        # Step 8: Q = Lambda^(n) + sigma * A * (2*C^(n+1) - C^(n)) - sigma * B
+        Q = Lambda + sigma * A @ (2 * C_next - C) - sigma * B
+        
+        # Step 9: Projection onto unit ball
+        norm_Q = np.linalg.norm(Q)
+        if norm_Q > 1.0:
+            Lambda_next = Q / norm_Q
+        else:
+            Lambda_next = Q
+        
+        # Step 10: Update ergodic sequence
+        C_bar = (n / (n + 1)) * C_bar + (1 / (n + 1)) * C_next
+        
+        # Update for next iteration
+        C = C_next
+        Lambda = Lambda_next
+        
+        # Store coefficients for error calculation
+        error_history_iter.append(np.copy(C_next))
+        error_history_ergodic.append(np.copy(C_bar))
+    
+    return C_bar, error_history_iter, error_history_ergodic
+
+# =============================================================================
+# EXACT Algorithm 5 Implementation (from pseudocode)
+# =============================================================================
+
+def algorithm_5_exact(A, B, w, lambda_param, T, R, eps_0, r, s, Psi_eval, y_true, w_pos):
+    """
+    EXACT Algorithm 5: primal-dual-rst-wSRLASSO-C
+    Following the pseudocode exactly line by line
+    BUT tracking error at EVERY inner iteration for smooth curves
+    """
+    m, N = A.shape
+    
+    # Step: initialize C_tilde^(0) = 0, eps_0 = ||B||_2
+    C_tilde = np.zeros(N)
+    eps_0_init = np.linalg.norm(B)  # ε₀ = ||b||₂ from Algorithm 5
+    
+    # Track convergence AT EVERY ITERATION (not just restart boundaries)
+    denom_sq = np.dot(y_true**2, w_pos)
+    iter_counts = [0]
+    error_history = [1.0]  # Initial error
+    total_iterations = 0
+    
+    eps_l = eps_0_init
+    
+    # Main restart loop: for l = 0, ..., R-1
+    for l in range(R):
+        # Step 2: eps_{l+1} = r * (eps_l + eps_0)
+        eps_l = r * (eps_l + eps_0)
+        
+        # Step 3: a_l = s * eps_{l+1}
+        a_l = s * eps_l
+        
+        # Step 4: Call Algorithm 2 with scaled inputs
+        if a_l > 1e-15:  # Avoid numerical issues
+            # Prepare scaled inputs exactly as in Algorithm 5
+            C_init_scaled = C_tilde / a_l if np.linalg.norm(C_tilde) > 0 else np.zeros(N)
+            Lambda_init_scaled = np.zeros(m)
+            B_scaled = B / a_l
+            
+            # Use step sizes from Table 5.1: τ = σ = ||A||₂⁻¹
+            norm_A = np.linalg.norm(A, ord=2)
+            tau = 1.0 / norm_A
+            sigma = 1.0 / norm_A
+            
+            # Call Algorithm 2 and get INNER iteration history
+            C_result, inner_iter_hist, inner_ergodic_hist = algorithm_2_exact(
+                A, B_scaled, w, lambda_param, tau, sigma, T, 
+                C_init_scaled, Lambda_init_scaled
+            )
+            
+            # KEY CHANGE: Track error at EVERY inner iteration
+            for t in range(T):
+                total_iterations += 1
+                
+                # Get current coefficient vector from inner iteration
+                C_inner_current = inner_ergodic_hist[t]  # Use ergodic sequence
+                
+                # Rescale back to original problem
+                C_tilde_current = a_l * C_inner_current
+                
+                # Calculate error at this iteration
+                if denom_sq > 0:
+                    y_pred = Psi_eval @ C_tilde_current
+                    num_sq = np.dot((y_true - y_pred)**2, w_pos)
+                    current_error = np.sqrt(num_sq / denom_sq)
+                    error_history.append(current_error)
+                    iter_counts.append(total_iterations)
+                else:
+                    error_history.append(np.nan)
+                    iter_counts.append(total_iterations)
+                
+                # Early stopping if we've reached 1000 iterations
+                if total_iterations >= 1000:
+                    break
+            
+            # Update C_tilde to final result of this restart
+            C_tilde = a_l * C_result
+        else:
+            # If a_l is too small, just advance iterations without computing
+            total_iterations += T
+        
+        # Break conditions
+        if total_iterations >= 1000:
+            break
+    
+    return C_tilde, iter_counts, error_history
+
+# =============================================================================
+# Helper Functions (Same as before)
+# =============================================================================
+
+def eval_orthonormal_legendre_1d(x, n_max):
+    x = np.asarray(x).flatten()
+    P = np.zeros((len(x), n_max + 1))
+    P[:, 0] = 1.0
+    if n_max > 0:
+        P[:, 1] = np.sqrt(3) * x
+    for n in range(1, n_max):
+        a_n = np.sqrt((2*n + 3) / (2*n + 1)) * (2*n + 1) / (n + 1)
+        b_n = np.sqrt((2*n + 3) / (2*n - 1)) * n / (n + 1)
+        P[:, n + 1] = a_n * x * P[:, n] - b_n * P[:, n-1]
+    return P
+
+def generate_hyperbolic_cross_corrected(d, n_hc):
+    indices = []
+    for alpha in itertools.product(*[range(n_hc + 1) for _ in range(d)]):
+        if np.prod(np.array(alpha) + 1) <= n_hc:
+            indices.append(alpha)
+    return np.array(indices)
+
+def f1(y, d):
+    return np.exp(-1/(2*d) * np.sum(y, axis=1))
+
+# =============================================================================
+# EXACT REPRODUCTION SETUP (Double-checked parameters)
+# =============================================================================
+
+print("EXACT Figure 5.1 Reproduction with ALL tolerance values")
+
+# Exact parameters from Figure 5.1 caption
+np.random.seed(42)
+d = 2
+m_train = 250
+
+# Find exact N=997
+target_N = 997
+Lambda = None
+for test_n in range(180, 200):
+    test_Lambda = generate_hyperbolic_cross_corrected(d, test_n)
+    if test_Lambda.shape[0] == target_N:
+        Lambda = test_Lambda
+        n_hc = test_n
+        break
+    elif test_Lambda.shape[0] > target_N:
+        Lambda = generate_hyperbolic_cross_corrected(d, test_n - 1)
+        n_hc = test_n - 1
+        break
+
+if Lambda is None:
+    Lambda = generate_hyperbolic_cross_corrected(d, 184)
+    n_hc = 184
+
+N_basis = Lambda.shape[0]
+print(f"n = {n_hc}, N = {N_basis}")
+
+# Generate data exactly as in the book
+xi_train = np.random.uniform(-1, 1, size=(m_train, d))
+F_train = f1(xi_train, d)
+
+# Evaluation grid (level 11, M = 7169 from caption)
+grid = Tasmanian.SparseGrid()
+grid.makeGlobalGrid(d, 0, 10, "level", "clenshaw-curtis")
+xi_eval = grid.getPoints()
+w_eval = grid.getQuadratureWeights()
+F_eval_true = f1(xi_eval, d)
+w_pos = np.abs(w_eval)
+print(f"Evaluation grid size: {xi_eval.shape[0]} (should be 7169)")
+
+# Build matrices
+n_max_degree = np.max(Lambda)
+P_train_1d = [eval_orthonormal_legendre_1d(xi_train[:, k], n_max_degree) for k in range(d)]
+P_eval_1d = [eval_orthonormal_legendre_1d(xi_eval[:, k], n_max_degree) for k in range(d)]
+
+A = np.ones((m_train, N_basis))
+Psi_eval = np.ones((xi_eval.shape[0], N_basis))
+for n_idx, L_n in enumerate(Lambda):
+    for k_dim in range(d):
+        A[:, n_idx] *= P_train_1d[k_dim][:, L_n[k_dim]]
+        Psi_eval[:, n_idx] *= P_eval_1d[k_dim][:, L_n[k_dim]]
+
+A /= np.sqrt(m_train)
+B = F_train / np.sqrt(m_train)
+
+# Intrinsic weights (equation 4.7)
+w = np.ones(N_basis)
+for i in range(N_basis): 
+    w[i] = np.prod(np.sqrt(2 * Lambda[i, :] + 1))
+
+# Parameters from Table 5.1 (experimental setup)
+lambda_param = 1.0 / np.sqrt(25 * m_train)  # (√25m)⁻¹
+
+print(f"λ = {lambda_param:.6f}")
+
+# =============================================================================
+# Run Algorithms with ALL tolerance values from Figure 5.1
+# =============================================================================
+
+print("Running exact algorithms...")
+
+# Algorithm 2 (Standard PD)
+T_standard = 1000
+norm_A = np.linalg.norm(A, ord=2)
+tau = 1.0 / norm_A  # From Table 5.1
+sigma = 1.0 / norm_A  # From Table 5.1
+
+print(f"||A||₂ = {norm_A:.6f}, τ = σ = {tau:.6f}")
+
+C_init = np.zeros(N_basis)
+Lambda_init = np.zeros(m_train)
+
+_, pd_iter_hist, pd_ergodic_hist = algorithm_2_exact(
+    A, B, w, lambda_param, tau, sigma, T_standard, C_init, Lambda_init
+)
+
+# Convert coefficient histories to error histories
+pd_error_iter = []
+pd_error_ergodic = []
+denom_sq = np.dot(F_eval_true**2, w_pos)
+
+for i in range(len(pd_iter_hist)):
+    # Iterate error
+    y_pred = Psi_eval @ pd_iter_hist[i]
+    num_sq = np.dot((F_eval_true - y_pred)**2, w_pos)
+    pd_error_iter.append(np.sqrt(num_sq / denom_sq))
+    
+    # Ergodic error
+    y_pred = Psi_eval @ pd_ergodic_hist[i]
+    num_sq = np.dot((F_eval_true - y_pred)**2, w_pos)
+    pd_error_ergodic.append(np.sqrt(num_sq / denom_sq))
+
+# Algorithm 5 (Restarted PD) - Extract exact parameters from Figure 5.1
+# Looking at book's legend: R = 28, T = 36
+ 
+total_iters = 1000      # keep total budget = 1000
+eps_0       = (25 * m_train)**(-0.5)
+T_inner = int(np.ceil(2 * (norm_A * np.e)))
+R_restarts = total_iters // T_inner    # compute T from formula
+print(f"Computed → R={R_restarts}, T={T_inner}, ζ₀={eps_0:.2e}")
+
+# Parameters from Table 5.1 and experimental setup
+r = np.exp(-1)  # e⁻¹ from Table 5.1
+s = T_inner / (2 * norm_A)  # T/(2||A||₂) from Table 5.1
+
+ 
+print(f"R = {R_restarts}, T = {T_inner}")
+print(f"r = {r:.6f}, s = {s:.6f}")
+
+# ALL tolerance values from Figure 5.1 (including 1e0, 1e-2, 1e-4, 1e-6, 1e-8, 1e-10)
+zeta_primes = [1e0, 1e-2, 1e-4, 1e-6, 1e-8, 1e-10]  # Complete set from book's legend
+pdr_histories = {}
+
+for zeta in zeta_primes:
+    print(f"Running Algorithm 5 with ζ' = {zeta:.0e}")
+    _, iter_counts, error_hist = algorithm_5_exact(
+        A, B, w, lambda_param, T_inner, R_restarts, zeta, r, s,
+        Psi_eval, F_eval_true, w_pos
+    )
+    pdr_histories[zeta] = (iter_counts, error_hist)
+
+# =============================================================================
+# Plot Results - Exact Figure 5.1 Style
+# =============================================================================
+
+plt.style.use('default')
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+# Colors from the book's figure (need 6 colors now for all tolerance values)
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']  # Blue, orange, green, red, purple, brown
+
+# Theoretical curve from equation (5.10) - EXACT coefficient from book
+# From Figure 5.1 legend: "exp(-ct), c = 2.8 × 10⁻2" )
+c_theoretical = 2.8e-2  
+theoretical_curve = [np.exp(-c_theoretical * t) for t in range(1, T_standard + 1)]
+
+# Left plot: relative L²ρ(U) error (iterates)
+ax1.semilogy(range(1, len(pd_error_iter) + 1), pd_error_iter, 'k--', 
+             label='PD', linewidth=1.5, alpha=0.8)
+ax1.semilogy(range(1, T_standard + 1), theoretical_curve, 'r:', 
+             label='exp(-ct), c = 2.8 × 10⁻2', linewidth=1.5)
+
+for i, zeta in enumerate(zeta_primes):
+    iter_counts, hist = pdr_histories[zeta]
+    if len(iter_counts) > 1:
+        if zeta >= 1:
+            label = f"PDR ζ' = {zeta:.0e}, R = {R_restarts}, T = {T_inner}"
+        else:
+            exp_notation = int(-np.log10(zeta))
+            label = f"PDR ζ' = 10⁻{exp_notation}, R = {R_restarts}, T = {T_inner}"
+        ax1.semilogy(iter_counts, hist, color=colors[i], label=label, linewidth=1.5)
+
+ax1.set_xlim(0, 1000)
+ax1.set_ylim(1e-10, 1e2)
+ax1.set_xlabel('iterations')
+ax1.set_ylabel('relative L²ρ(U) error')
+ax1.grid(True, alpha=0.3)
+ax1.legend(loc='upper right', fontsize=8)
+
+# Right plot: ergodic sequence relative L²ρ(U) error
+ax2.semilogy(range(1, len(pd_error_ergodic) + 1), pd_error_ergodic, 'k--', 
+             label='PD', linewidth=1.5, alpha=0.8)
+ax2.semilogy(range(1, T_standard + 1), theoretical_curve, 'r:', 
+             label='exp(-ct), c = 2.5 × 10⁻³', linewidth=1.5)
+
+for i, zeta in enumerate(zeta_primes):
+    iter_counts, hist = pdr_histories[zeta]
+    if len(iter_counts) > 1:
+        if zeta >= 1:
+            label = f"PDR ζ' = {zeta:.0e}, R = {R_restarts}, T = {T_inner}"
+        else:
+            exp_notation = int(-np.log10(zeta))
+            label = f"PDR ζ' = 10⁻{exp_notation}, R = {R_restarts}, T = {T_inner}"
+        ax2.semilogy(iter_counts, hist, color=colors[i], label=label, linewidth=1.5)
+
+ax2.set_xlim(0, 1000)
+ax2.set_ylim(1e-10, 1e2)
+ax2.set_xlabel('iterations')
+ax2.set_ylabel('ergodic sequence relative L²ρ(U) error')
+ax2.grid(True, alpha=0.3)
+ax2.legend(loc='upper right', fontsize=8)
+
+plt.tight_layout()
+plt.show()
+
+print(f"\nEXACT Figure 5.1 reproduction completed!")
+print(f"Parameters used:")
+print(f"  N = {N_basis}, m = {m_train}, d = {d}")
+print(f"  λ = {lambda_param:.6f}")
+print(f"  ||A||₂ = {norm_A:.6f}")
+print(f"  R = {R_restarts}, T = {T_inner}")
+print(f"  r = {r:.6f}, s = {s:.6f}")
+print(f"  c (theoretical) = {c_theoretical}")
