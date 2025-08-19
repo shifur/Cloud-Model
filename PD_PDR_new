@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+11D Cloud Microphysics — PD/PDR with Table 5.1 hyperparameter formulas.
+(NO 1/sqrt(m) scaling on A or b.)
+
+- All 11 input parameters vary.
+- Hyperparameters per Table 5.1:
+    lambda  = (sqrt(25*m))^{-1}
+    sigma   = ||A||_2^{-1}
+    tau     = ||A||_2^{-1}
+    r       = e^{-1}
+    T_inner = ceil( 2||A||_2 / ( r * sqrt(sigma*tau) ) ) = ceil( 2||A||_2^2 / r )
+    s       = T_inner / (2 ||A||_2)
+- Restarts R chosen to hit a target total step budget:
+    R = ceil(TARGET_TOTAL_STEPS / T_inner), with T_pd = R * T_inner
+
+External deps: Tasmanian, parmap_framework, module_runcrm
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import legendre
+import sys
+import time
+import warnings
+warnings.filterwarnings("ignore", message="Glyph.*missing from font")
+
+# --- External packages paths (customize if needed) ---
+sys.path.append('/home/ss24ce/.local/lib/python3.10/site-packages')
+
+import Tasmanian
+from parmap_framework import parmap
+from module_runcrm import runcrm
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+RNG_SEED = 42
+
+# PD/PDR early stop (optional)
+PD_EARLY_STOP      = False
+PD_EARLY_STOP_TOL  = 1e-8
+
+# Training sizes
+TRAIN_SIZES = list(range(50, 2001, 50))  # 50..1000
+
+# SG configuration for 11D
+LEVEL_11D = 4              # keep conservative; raise if resources allow
+GRID_RULE = "clenshaw-curtis"
+
+# Cloud model I/O
+INPUT_FILE  = './cloud_column_model/run_one_crm1d.txt'
+OUTPUT_FILE = './cloud_column_model/crm1d_output.txt'
+NAMELIST    = './cloud_column_model/namelist_3h_t30-180.f90'
+
+# Outputs from CRM (columns 18..23 inclusive -> 6 outputs)
+OUTPUT_NAMES = ['PCP', 'ACC', 'LWP', 'IWP', 'OLR', 'OSR']
+K = 6
+
+# Parmap settings
+PARMASTER   = 'scispark6.jpl.nasa.gov:8786'
+PARNWORKERS = 12
+PARMODE     = 'par'
+
+# Target total primal-dual steps (for PD and PDR fairness)
+TARGET_TOTAL_STEPS = 2000
+
+# =============================================================================
+# EXACT Algorithms (PD and PDR)
+# =============================================================================
+
+def algorithm_2_exact(A, B, w, lambda_param, tau, sigma, T, C_init, Lambda_init,
+                      early_stop=False, early_stop_tol=1e-8):
+    m, N = A.shape
+    C_bar = np.zeros(N)
+    C = np.array(C_init, dtype=float, copy=True)
+    Lambda = np.array(Lambda_init, dtype=float, copy=True)
+
+    thr_base = tau * lambda_param * w  # (N,)
+
+    for n in range(T):
+        P = C - tau * (A.T @ Lambda)
+        C_next = np.sign(P) * np.maximum(np.abs(P) - thr_base, 0.0)
+        Q = Lambda + sigma * (A @ (2.0 * C_next - C)) - sigma * B
+        norm_Q = np.linalg.norm(Q)
+        Lambda_next = Q / norm_Q if norm_Q > 1.0 else Q
+        C_bar = (n / (n + 1.0)) * C_bar + (1.0 / (n + 1.0)) * C_next
+
+        if early_stop and n > 0:
+            denom = max(np.linalg.norm(C), 1.0)
+            rel_change = np.linalg.norm(C_next - C) / denom
+            if rel_change < early_stop_tol:
+                C = C_next
+                Lambda = Lambda_next
+                break
+
+        C = C_next
+        Lambda = Lambda_next
+
+    return C_bar, None, None
+
+
+def algorithm_5_exact(A, B, w, lambda_param, T, R, eps_0, r, s,
+                      tau=None, sigma=None, max_iter=10**9,
+                      pd_early_stop=False, pd_early_stop_tol=1e-8):
+    m, N = A.shape
+    C_tilde = np.zeros(N)
+    eps_l = np.linalg.norm(B)
+
+    if (tau is None) or (sigma is None):
+        norm_A = np.linalg.norm(A, ord=2)
+        tau_eff = 1.0 / norm_A
+        sigma_eff = 1.0 / norm_A
+    else:
+        tau_eff = float(tau)
+        sigma_eff = float(sigma)
+
+    total_iterations = 0
+    for l in range(R):
+        eps_l = r * (eps_l + eps_0)
+        a_l = s * eps_l
+        if a_l > 1e-15:
+            C_init_scaled = (C_tilde / a_l) if (np.linalg.norm(C_tilde) > 0) else np.zeros(N)
+            Lambda_init_scaled = np.zeros(m)
+            B_scaled = B / a_l
+            C_result, _, _ = algorithm_2_exact(
+                A, B_scaled, w, lambda_param, tau_eff, sigma_eff, T,
+                C_init_scaled, Lambda_init_scaled,
+                early_stop=pd_early_stop, early_stop_tol=pd_early_stop_tol
+            )
+            C_tilde = a_l * C_result
+            total_iterations += T
+        else:
+            total_iterations += T
+
+        if total_iterations >= max_iter:
+            break
+    return C_tilde
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def compute_intrinsic_weights_legendre(Lambda):
+    """ u_ν = ∏_{j=1}^d √(2ν_j + 1) """
+    N_basis = Lambda.shape[0]
+    d = Lambda.shape[1]
+    weights = np.ones(N_basis, dtype=float)
+    for n in range(N_basis):
+        for k in range(d):
+            weights[n] *= np.sqrt(2 * Lambda[n, k] + 1)
+    return weights
+
+def map_to_canonical(X, pmin, pmax):
+    return 2.0 * (X - pmin) / (pmax - pmin) - 1.0
+
+def multiidx_gen(N, rule, w, base=0, multiidx=np.array([]), MULTI_IDX=np.array([])):
+    """ Generate hyperbolic cross multi-index set with rule=HCfunc up to level w """
+    if len(multiidx) != N:
+        i = base
+        while rule(np.append(multiidx, i)) <= w:
+            MULTI_IDX = multiidx_gen(N, rule, w, base, np.append(multiidx, i), MULTI_IDX)
+            i += 1
+    else:
+        MULTI_IDX = np.vstack([MULTI_IDX, multiidx]) if MULTI_IDX.size else multiidx
+    return MULTI_IDX
+
+def compute_table51_hparams(A, m):
+    """Return lambda, tau, sigma, r, T_inner, s based on Table 5.1."""
+    normA2 = np.linalg.norm(A, ord=2)
+    sigma = 1.0 / normA2
+    tau = 1.0 / normA2
+    r = np.exp(-1.0)
+    T_inner = int(np.ceil((2.0 * normA2) / (r * np.sqrt(sigma * tau))))
+    T_inner = max(T_inner, 1)
+    s = T_inner / (2.0 * normA2)
+    lam = (np.sqrt(25.0 * m)) ** -1
+    return lam, tau, sigma, r, T_inner, s, normA2
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    np.random.seed(RNG_SEED)
+
+    # --- 11D bounds and names (all vary) ---
+    pmin = np.array([50.0, 0.10, 50.0, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 1.e-4, 2.e-6], dtype=float)
+    pmax = np.array([1000.0, 1.0, 1200.0, 0.90, 5.0, 2.5, 2.5, 1.0, 1.0, 2.e-3, 1.e-3], dtype=float)
+    xnames = ['as', 'bs', 'ag', 'bg', 'N0r', 'N0s', 'N0g', 'rhos', 'rhog', 'qc0', 'qi0']
+
+    d = 11
+    print("11D Parameter Analysis Setup:")
+    for j, name in enumerate(xnames):
+        print(f"  {name}: [{pmin[j]:.2e}, {pmax[j]:.2e}]")
+
+    # --- Hyperbolic cross multi-index ---
+    HCfunc = lambda x: np.prod(x + 1) - 1
+    p_poly = 20  # modest for 11D; raise if resources allow
+    Lambda = multiidx_gen(d, HCfunc, p_poly).astype(int)
+    N_basis = Lambda.shape[0]
+    print(f"11D basis size (HC level {p_poly}): {N_basis}")
+
+    # Intrinsic weights (Legendre)
+    weights = compute_intrinsic_weights_legendre(Lambda)
+    print(f"Intrinsic weights range: [{np.min(weights):.3f}, {np.max(weights):.3f}]")
+
+    # --- Tasmanian Sparse Grid for 11D ---
+    grid = Tasmanian.SparseGrid()
+    grid.makeGlobalGrid(d, 0, LEVEL_11D, "level", GRID_RULE)
+    grid.clearDomainTransform()
+
+    xi_can = grid.getPoints()           # (m_sg, 11)
+    w_can = grid.getQuadratureWeights()
+    m_sg = xi_can.shape[0]
+    print(f"SG grid size (11D, level {LEVEL_11D}): {m_sg}")
+
+    # Physical points
+    x_phys_sg = 0.5 * (xi_can + 1.0) * (pmax - pmin) + pmin
+
+    print("Running CRM for SG projection...")
+    runs_sg = [[INPUT_FILE, OUTPUT_FILE, NAMELIST, i+1, x_phys_sg[i].tolist()] for i in range(m_sg)]
+    pmap = parmap.Parmap(master=PARMASTER, mode=PARMODE, numWorkers=PARNWORKERS)
+    F_sg_full = np.array(pmap(runcrm, runs_sg))
+    F_sg = F_sg_full[:, 18:24]  # 6 outputs
+
+    # Build Ψ on SG points
+    Psi_sg = np.ones((m_sg, N_basis), dtype=float)
+    for n in range(N_basis):
+        for kdim in range(d):
+            Pk = legendre(Lambda[n, kdim])
+            norm = np.sqrt((2 * Lambda[n, kdim] + 1) / 2.0)
+            Psi_sg[:, n] *= norm * Pk(xi_can[:, kdim])
+
+    # SG Gram matrix (diagnostic) with 1/2^d scaling; coeffs via projection
+    w_prob = w_can / (2.0 ** d)
+    G_sg = Psi_sg.T @ (w_prob[:, None] * Psi_sg)
+    coeff_sg = Psi_sg.T @ (w_prob[:, None] * F_sg)
+
+    diag_err = np.max(np.abs(np.diag(G_sg) - 1.0))
+    offdiag_err = np.max(np.abs(G_sg - np.diag(np.diag(G_sg))))
+    print(f"SG Gram matrix - Diagonal error: {diag_err:.2e}, Off-diagonal error: {offdiag_err:.2e}")
+
+    # =============================================================================
+    # LEARNING CURVES (Table 5.1; NO sqrt(m) scaling)
+    # =============================================================================
+
+    print(f"Training sizes to test: {TRAIN_SIZES}")
+    m_train_max = max(TRAIN_SIZES)
+    x_train_max = np.random.uniform(pmin, pmax, size=(m_train_max, d))
+    xi_train_max = map_to_canonical(x_train_max, pmin, pmax)
+
+    print(f"Generating {m_train_max} training samples (11D)...")
+    runs_train_max = [[INPUT_FILE, OUTPUT_FILE, NAMELIST, i+1, x_train_max[i].tolist()] for i in range(m_train_max)]
+    F_train_max_full = np.array(pmap(runcrm, runs_train_max))
+    F_train_max = F_train_max_full[:, 18:24]
+
+    # Storage
+    learning_curve_results = {
+        'train_sizes': TRAIN_SIZES,
+        'l2_errors_pd': [],
+        'l2_errors_pdr': [],
+        'sparsity_pd': [],
+        'sparsity_pdr': [],
+        'solve_times_pd': [],
+        'solve_times_pdr': []
+    }
+
+    for train_size in TRAIN_SIZES:
+        print("\n" + "="*60)
+        print(f"Training with {train_size} samples (11D)")
+        print("="*60)
+
+        xi_train = xi_train_max[:train_size]
+        F_train  = F_train_max[:train_size]
+
+        # A matrix 
+        A = np.ones((train_size, N_basis), dtype=float)
+        for n in range(N_basis):
+            for kdim in range(d):
+                Pk = legendre(Lambda[n, kdim])
+                norm = np.sqrt((2 * Lambda[n, kdim] + 1) / 2.0)
+                A[:, n] *= norm * Pk(xi_train[:, kdim])
+
+        # === Table 5.1 hyperparameters ===
+        lam, tau, sigma, r, T_inner, s, normA2 = compute_table51_hparams(A, train_size)
+
+        # Choose R to meet a target total budget; PD uses same total steps for fairness
+        R = int(np.ceil(TARGET_TOTAL_STEPS / T_inner))
+        R = max(R, 1)
+        T_pd = R * T_inner  # total PD iterations
+
+        print("Hyperparameters (Table 5.1):")
+        print(f"  λ = {lam:.6f}")
+        print(f"  ||A||₂ = {normA2:.6f}")
+        print(f"  τ = σ = {tau:.6f} (= 1/||A||₂)")
+        print(f"  r = {r:.6f}")
+        print(f"  T_inner = {T_inner}, s = {s:.6f}")
+        print(f"  R (from budget) = {R}, T_pd = {T_pd} (same total steps)")
+
+        # PD solve 
+        xhat_pd = np.zeros((N_basis, K), dtype=float)
+        t0 = time.time()
+        for kout in range(K):
+            b = F_train[:, kout]  # no scaling
+            C_init = np.zeros(N_basis, dtype=float)
+            Lambda_init = np.zeros(train_size, dtype=float)
+            C_result_pd, _, _ = algorithm_2_exact(
+                A, b, weights, lam, tau, sigma, T_pd,
+                C_init, Lambda_init,
+                early_stop=PD_EARLY_STOP, early_stop_tol=PD_EARLY_STOP_TOL
+            )
+            xhat_pd[:, kout] = C_result_pd
+        t1 = time.time()
+        solve_time_pd = t1 - t0
+
+        # PDR solve
+        xhat_pdr = np.zeros((N_basis, K), dtype=float)
+        t0 = time.time()
+        for kout in range(K):
+            b = F_train[:, kout]  # no scaling
+            C_result_pdr = algorithm_5_exact(
+                A, b, weights, lam, T_inner, R, eps_0=1e-6, r=r, s=s,
+                tau=tau, sigma=sigma, max_iter=T_pd,  # cap to same total steps
+                pd_early_stop=PD_EARLY_STOP, pd_early_stop_tol=PD_EARLY_STOP_TOL
+            )
+            xhat_pdr[:, kout] = C_result_pdr
+        t1 = time.time()
+        solve_time_pdr = t1 - t0
+
+        print(f"✔ PD solved in  {solve_time_pd:.2f} s")
+        print(f"✔ PDR solved in {solve_time_pdr:.2f} s")
+
+        # L2 errors on SG points (11D)
+        volume_phys = np.prod(pmax - pmin)
+        w_phys = w_can * (volume_phys / (2.0 ** d))
+        w_pos = np.abs(w_phys)
+
+        Psi_SG_eval = Psi_sg
+        y_SG_eval_pd = Psi_SG_eval @ xhat_pd
+        y_SG_eval_pdr = Psi_SG_eval @ xhat_pdr
+        y_true_SG = F_sg
+
+        l2_rel_error_pd = np.zeros(K, dtype=float)
+        l2_rel_error_pdr = np.zeros(K, dtype=float)
+        for kout in range(K):
+            diff_pd = y_true_SG[:, kout] - y_SG_eval_pd[:, kout]
+            num_sq_pd = np.dot((diff_pd**2), w_pos)
+            denom_sq  = np.dot((y_true_SG[:, kout]**2), w_pos)
+            l2_rel_error_pd[kout] = np.sqrt(num_sq_pd / denom_sq) if denom_sq > 0 else np.nan
+
+            diff_pdr = y_true_SG[:, kout] - y_SG_eval_pdr[:, kout]
+            num_sq_pdr = np.dot((diff_pdr**2), w_pos)
+            l2_rel_error_pdr[kout] = np.sqrt(num_sq_pdr / denom_sq) if denom_sq > 0 else np.nan
+
+        sparsity_pd  = [int(np.count_nonzero(np.abs(xhat_pd[:, kout])  > 1e-12)) for kout in range(K)]
+        sparsity_pdr = [int(np.count_nonzero(np.abs(xhat_pdr[:, kout]) > 1e-12)) for kout in range(K)]
+
+        # Store
+        learning_curve_results['l2_errors_pd'].append(l2_rel_error_pd.copy())
+        learning_curve_results['l2_errors_pdr'].append(l2_rel_error_pdr.copy())
+        learning_curve_results['sparsity_pd'].append(sparsity_pd)
+        learning_curve_results['sparsity_pdr'].append(sparsity_pdr)
+        learning_curve_results['solve_times_pd'].append(solve_time_pd)
+        learning_curve_results['solve_times_pdr'].append(solve_time_pdr)
+
+        print("L2 Relative Errors:")
+        print(f"  PD:  {l2_rel_error_pd}")
+        print(f"  PDR: {l2_rel_error_pdr}")
+        print("Average L2 Error:")
+        print(f"  PD:  {np.mean(l2_rel_error_pd):.6f}")
+        print(f"  PDR: {np.mean(l2_rel_error_pdr):.6f}")
+
+    # --- Plot learning curves ---
+    l2_errors_pd_array  = np.array(learning_curve_results['l2_errors_pd'])
+    l2_errors_pdr_array = np.array(learning_curve_results['l2_errors_pdr'])
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+    for kplot in range(K):
+        ax = axes[kplot]
+        ax.loglog(TRAIN_SIZES, l2_errors_pd_array[:, kplot], 'o-', label='PD (Table 5.1)')
+        ax.loglog(TRAIN_SIZES, l2_errors_pdr_array[:, kplot], 's-', label='PDR (Table 5.1)')
+        ax.set_xlabel('Training Sample Size')
+        ax.set_ylabel('L2 Relative Error')
+        ax.set_title(f'Learning Curve: {OUTPUT_NAMES[kplot]} (11D)')
+        ax.legend()
+        ax.grid(True, which='both', alpha=0.3)
+        theoretical_decay = 0.1 * (np.array(TRAIN_SIZES) / TRAIN_SIZES[0])**(-0.5)
+        ax.loglog(TRAIN_SIZES, theoretical_decay, '--', alpha=0.7, label='m^(-1/2) reference')
+    plt.suptitle('11D Learning Curves (Table 5.1 formulas, no sqrt(m) scaling)', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Average learning curve ---
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    avg_l2_pd  = np.mean(l2_errors_pd_array, axis=1)
+    avg_l2_pdr = np.mean(l2_errors_pdr_array, axis=1)
+    ax.loglog(TRAIN_SIZES, avg_l2_pd,  'o-', label='PD (Table 5.1)')
+    ax.loglog(TRAIN_SIZES, avg_l2_pdr, 's-', label='PDR (Table 5.1)')
+    theoretical_decay = 0.1 * (np.array(TRAIN_SIZES) / TRAIN_SIZES[0])**(-0.5)
+    ax.loglog(TRAIN_SIZES, theoretical_decay, '--', alpha=0.7, label='m^(-1/2) reference')
+    ax.set_xlabel('Training Sample Size')
+    ax.set_ylabel('Average L2 Relative Error')
+    ax.set_title('11D Average Learning Curve: PD vs PDR (Table 5.1)')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Sparsity evolution ---
+    sparsity_pd_array  = np.array(learning_curve_results['sparsity_pd'])
+    sparsity_pdr_array = np.array(learning_curve_results['sparsity_pdr'])
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    avg_sparsity_pd  = np.mean(sparsity_pd_array, axis=1)
+    avg_sparsity_pdr = np.mean(sparsity_pdr_array, axis=1)
+    ax.plot(TRAIN_SIZES, avg_sparsity_pd,  'o-', label='PD (Table 5.1)')
+    ax.plot(TRAIN_SIZES, avg_sparsity_pdr, 's-', label='PDR (Table 5.1)')
+    ax.set_xlabel('Training Sample Size')
+    ax.set_ylabel('Average Number of Nonzero Coefficients')
+    ax.set_title('11D Sparsity Evolution: PD vs PDR (Table 5.1)')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Solve times ---
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    solve_times_pd  = learning_curve_results['solve_times_pd']
+    solve_times_pdr = learning_curve_results['solve_times_pdr']
+    ax.plot(TRAIN_SIZES, solve_times_pd,  'o-', label='PD (Table 5.1)')
+    ax.plot(TRAIN_SIZES, solve_times_pdr, 's-', label='PDR (Table 5.1)')
+    ax.set_xlabel('Training Sample Size')
+    ax.set_ylabel('Solve Time (seconds)')
+    ax.set_title('11D Computational Time: PD vs PDR (Table 5.1)')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    print("\nFinal Summary (11D, Table 5.1, no sqrt(m) scaling):")
+    print(f"- All 11 parameters varied: {', '.join(xnames)}")
+    print(f"- Basis size: {N_basis}")
+    print(f"- SG grid size (level {LEVEL_11D}): {m_sg}")
+    print(f"- Training sizes: {len(TRAIN_SIZES)} (max={max(TRAIN_SIZES)})")
+    print(f"- Intrinsic weights range: [{np.min(weights):.3f}, {np.max(weights):.3f}]")
+
+if __name__ == "__main__":
+    main()
