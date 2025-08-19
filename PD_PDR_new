@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 11D Cloud Microphysics — PD/PDR with Table 5.1 hyperparameter formulas.
-(NO 1/sqrt(m) scaling on A or b.)
+
 
 - All 11 input parameters vary.
 - Hyperparameters per Table 5.1:
