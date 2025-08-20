@@ -44,7 +44,7 @@ PD_EARLY_STOP      = False
 PD_EARLY_STOP_TOL  = 1e-8
 
 # Training sizes
-TRAIN_SIZES = list(range(50, 2001, 50))  # 50..2000
+TRAIN_SIZES = list(range(50, 2001, 50))  # 50..1000
 
 # SG configuration for 11D
 LEVEL_11D = 4              # keep conservative; raise if resources allow
@@ -231,7 +231,7 @@ def main():
     for n in range(N_basis):
         for kdim in range(d):
             Pk = legendre(Lambda[n, kdim])
-            norm = np.sqrt((2 * Lambda[n, kdim] + 1) / 2.0)
+            norm = np.sqrt((2 * Lambda[n, kdim] + 1))
             Psi_sg[:, n] *= norm * Pk(xi_can[:, kdim])
 
     # SG Gram matrix (diagnostic) with 1/2^d scaling; coeffs via projection
@@ -281,48 +281,35 @@ def main():
         for n in range(N_basis):
             for kdim in range(d):
                 Pk = legendre(Lambda[n, kdim])
-                norm = np.sqrt((2 * Lambda[n, kdim] + 1) / 2.0)
+                norm = np.sqrt((2 * Lambda[n, kdim] + 1))
                 A[:, n] *= norm * Pk(xi_train[:, kdim])
+        A=A/np.sqrt(train_size)  # normalize A by sqrt(m) for consistency with PD/PDR
 
         # === Table 5.1 hyperparameters ===
         lam, tau, sigma, r, T_inner, s, normA2 = compute_table51_hparams(A, train_size)
 
-        # ------------------------ CHANGED BLOCK (start) ------------------------
-        # Hard-cap the total iteration budget at TARGET_TOTAL_STEPS (≤ 2000)
-        # Prefer using complete inner blocks; avoid overshoot.
-        if T_inner <= TARGET_TOTAL_STEPS:
-            R = max(1, TARGET_TOTAL_STEPS // T_inner)   # floor, not ceil  # CHANGED
-            T_inner_used = T_inner                        # CHANGED
-        else:
-            # One inner block already exceeds the budget → shorten the single block
-            R = 1                                         # CHANGED
-            T_inner_used = TARGET_TOTAL_STEPS             # CHANGED
-
-        T_pd = min(R * T_inner_used, TARGET_TOTAL_STEPS)  # CHANGED: ≤ cap
-
-        # Keep s consistent with the *actual* inner-iterations we will run
-        # (Table 5.1: s = T_inner / (2||A||_2))
-        s_used = T_inner_used / (2.0 * normA2)            # CHANGED
-        # ------------------------- CHANGED BLOCK (end) -------------------------
+        # Choose R to meet a target total budget; PD uses same total steps for fairness
+        R = int(np.ceil(TARGET_TOTAL_STEPS / T_inner))
+        R = max(R, 1)
+        T_pd = R * T_inner  # total PD iterations
 
         print("Hyperparameters (Table 5.1):")
         print(f"  λ = {lam:.6f}")
         print(f"  ||A||₂ = {normA2:.6f}")
         print(f"  τ = σ = {tau:.6f} (= 1/||A||₂)")
         print(f"  r = {r:.6f}")
-        print(f"  T_inner (raw) = {T_inner}, s_raw = {s:.6f}")  # CHANGED (log raw)
-        print(f"  Using: R = {R}, T_inner_used = {T_inner_used}, s_used = {s_used:.6f}")  # CHANGED (log used)
-        print(f"  T_pd = {T_pd} (capped ≤ {TARGET_TOTAL_STEPS})")  # CHANGED
+        print(f"  T_inner = {T_inner}, s = {s:.6f}")
+        print(f"  R (from budget) = {R}, T_pd = {T_pd} (same total steps)")
 
         # PD solve (b is NOT divided by sqrt(m))
         xhat_pd = np.zeros((N_basis, K), dtype=float)
         t0 = time.time()
         for kout in range(K):
-            b = F_train[:, kout]
+            b = F_train[:, kout]/np.sqrt(train_size) 
             C_init = np.zeros(N_basis, dtype=float)
             Lambda_init = np.zeros(train_size, dtype=float)
             C_result_pd, _, _ = algorithm_2_exact(
-                A, b, weights, lam, tau, sigma, T_pd,   # CHANGED: use capped total iters
+                A, b, weights, lam, tau, sigma, T_pd,
                 C_init, Lambda_init,
                 early_stop=PD_EARLY_STOP, early_stop_tol=PD_EARLY_STOP_TOL
             )
@@ -334,11 +321,10 @@ def main():
         xhat_pdr = np.zeros((N_basis, K), dtype=float)
         t0 = time.time()
         for kout in range(K):
-            b = F_train[:, kout]  # no scaling
+            b = F_train[:, kout]/np.sqrt(train_size)
             C_result_pdr = algorithm_5_exact(
-                A, b, weights, lam,
-                T=T_inner_used, R=R, eps_0=1e-6, r=r, s=s_used,  # CHANGED: use *used* inner size & s
-                tau=tau, sigma=sigma, max_iter=T_pd,             # CHANGED: cap total iterations
+                A, b, weights, lam, T_inner, R, eps_0=1e-6, r=r, s=s,
+                tau=tau, sigma=sigma, max_iter=T_pd,  # cap to same total steps
                 pd_early_stop=PD_EARLY_STOP, pd_early_stop_tol=PD_EARLY_STOP_TOL
             )
             xhat_pdr[:, kout] = C_result_pdr
